@@ -1,0 +1,30 @@
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.pet-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+.pet-root:active {
+  cursor: grabbing;
+}
+
+.pet-root .stage-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}

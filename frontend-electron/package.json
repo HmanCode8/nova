@@ -1,0 +1,79 @@
+{
+  "name": "nova-secretary-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NovaSecretary 跨平台桌面 AI 秘书",
+  "author": "NovaSecretary",
+  "type": "module",
+  "main": "electron-main/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "electron": "electron .",
+    "build:backend": "node build-backend.mjs",
+    "dist:win": "pnpm build:backend && vite build && electron-builder --win nsis",
+    "dist:dir": "vite build && electron-builder --dir"
+  },
+  "dependencies": {
+    "markdown-it": "^15.0.3",
+    "vue": "^3.5.44"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
+    "vite": "^8.3.5"
+  },
+  "build": {
+    "appId": "com.nova.secretary",
+    "productName": "NovaSecretary",
+    "copyright": "Copyright © 2026 NovaSecretary",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron-main/**/*",
+      "src/preload/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../assets",
+        "to": "assets"
+      },
+      {
+        "from": "../backend/dist/nova-backend",
+        "to": "backend"
+      },
+      {
+        "from": "../backend/.env.example",
+        "to": "backend/.env.example"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "NovaSecretary-${version}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NovaSecretary",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

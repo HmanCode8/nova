@@ -1,0 +1,25 @@
+# ===== Python =====
+backend/.venv/
+__pycache__/
+*.py[cod]
+backend/.env
+
+# ===== Node / Electron =====
+frontend-electron/node_modules/
+frontend-electron/dist/
+frontend-electron/release/
+frontend-electron/.vite/
+.pnpm-store/
+.pnpm-cache/
+.cache/
+
+# ===== 构建与本地数据 =====
+backend/build/
+backend/dist/
+*.log
+screenshots/
+temp/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

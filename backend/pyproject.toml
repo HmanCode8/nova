@@ -1,0 +1,26 @@
+[project]
+name = "nova-secretary-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "fastapi>=0.162.0",
+    "faster-whisper>=1.2.1",
+    "httpx>=0.28.1",
+    "langchain-openai>=1.7.3",
+    "langchain-tavily>=0.2.18",
+    "langgraph>=1.2.18",
+    "pillow>=13.0.0",
+    "piper-tts>=1.8.0",
+    "pyperclip>=1.11.0",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.32",
+    "rapidocr-onnxruntime>=1.4.4",
+    "sounddevice>=0.5.6",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22.3",
+]
