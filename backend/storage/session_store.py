@@ -102,13 +102,14 @@ async def add_message(
     tool_result: Optional[str] = None,
     file_id: Optional[str] = None,
     attachments: Optional[list[dict[str, Any]]] = None,
+    reasoning: Optional[str] = None,
 ) -> str:
     message_id = uuid.uuid4().hex
     await db.execute(
         """
         INSERT INTO messages
-            (id, session_id, role, content, tool_name, tool_result, file_id, attachments_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, session_id, role, content, tool_name, tool_result, file_id, attachments_json, reasoning, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             message_id,
@@ -119,6 +120,7 @@ async def add_message(
             _slim(tool_result, MAX_TOOL_RESULT_CHARS) if tool_result is not None else None,
             file_id,
             json.dumps(attachments, ensure_ascii=False) if attachments else None,
+            _slim(reasoning, MAX_TOOL_RESULT_CHARS) if reasoning else None,
             _now(),
         ),
     )
@@ -128,7 +130,7 @@ async def add_message(
 async def list_messages(session_id: str, limit: int = 200) -> list[dict[str, Any]]:
     rows = await db.fetch_all(
         """
-        SELECT id, role, content, tool_name, tool_result, file_id, attachments_json, created_at
+        SELECT id, role, content, tool_name, tool_result, file_id, attachments_json, reasoning, created_at
         FROM messages WHERE session_id = ?
         ORDER BY created_at ASC, rowid ASC LIMIT ?
         """,

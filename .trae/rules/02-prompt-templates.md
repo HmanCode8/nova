@@ -1,39 +1,28 @@
 # SKILL：开发提示词模板
 技能描述：新增模块、评审方案、修复bug时使用对应模板
 
-### 模板A：新增普通后端Agent工具
+### 模板A：新增内置工具
 当前阶段：【填入阶段】
 需求：开发后端工具：____
 作用：____
 入参：____
 返回：____
 约束：
-1. LangGraph @tool 装饰器实现，兼容LangChain工具注册体系
-2. 高危操作增加二次确认弹窗逻辑
-3. 文件放到 backend/tools/
-4. 提供uv新增依赖、注册进Agent的代码、独立测试脚本
+1. 使用 @tool 装饰器，兼容LangChain工具注册体系
+2. 必须在 middleware 的 Trace 埋点中记录
+3. 如果涉及文件操作，必须做白名单路径校验
+4. 如果是删除操作，必须走 interrupt 人工确认流程
+5. 提供 uv 新增依赖、注册进 Agent 的代码、独立测试脚本
 
-### 模板A2：接入LangChain预定义联网工具（Tavily专用）
-当前阶段：阶段1
-需求：接入TavilySearchResults联网搜索工具
-要求：
-1. 使用标准封装代码，backend/tools/tavily_search_tool.py
-2. 设置面板增加开关，动态控制 WEB_SEARCH_ENABLED
-3. 工具返回结构化数据，方便前端渲染卡片（标题、url、摘要）
-4. 写入.env读取TAVILY_API_KEY，无key或者关闭联网时友好提示
-5. ws向前端推送搜索结果结构化数据
-6. 提供uv依赖、测试脚本
-
-### 模板B：Electron前端窗口/UI开发
+### 模板B：前端组件开发
 当前阶段：____
 需求：开发前端功能：____
-技术栈 Vue3 + Electron，代码放到 frontend-electron
+技术栈 Tauri + Vue3，代码放在 frontend/src
 要求：
-1. 悬浮窗口必须配置：frameless transparent alwaysOnTop skipTaskbar
-2. preload安全隔离，遵循IPC安全规范
-3. 对接websocket接收Agent状态、工具结果
-4. 区分Mac/Windows快捷键差异
-5. 给出pnpm依赖、Mac(zsh)/Windows(powershell)调试启动命令
+1. 与科技深色风格统一
+2. 对接 websocket 接收 Agent 事件（token/工具状态/删除确认/任务日志）
+3. 区分 Mac/Windows 差异
+4. 给出 pnpm 依赖、Mac(zsh)/Windows(powershell) 调试启动命令
 
 ### 模板C：Bug修复
 问题现象：【粘贴报错、现象】
@@ -46,26 +35,27 @@
 请输出：
 1. 方案选型
 2. 需要改动的文件清单（后端/前端）
-3. 新增依赖清单
+3. 新增依赖
 4. Mac、Windows各自风险坑点
 5. 分步实现顺序
 等待我确认方案，再开始写代码
 
-### 模板E：MCP工具对接（邮件/日历）
-当前阶段：阶段2.5
-需求：对接____ MCP Server，注册LangGraph工具
+### 模板E：MCP接入
+当前阶段：阶段2
+需求：接入____ MCP Server，注册进Agent
 要求：
-1. backend/mcp_client 模块，stdio方式连接MCP服务
-2. Agent支持链式调用，例如同时查日程、邮件、联网搜索
-3. 写邮件、新建日程强制二次确认弹窗
-4. ws向前端推送结构化卡片数据
+1. 使用官方 mcp SDK，backend/mcp_manager 模块
+2. MCP 工具包装成 BaseTool 接入 LangGraph
+3. MCP 只返回原始数据/资源路径，解析逻辑交给内置工具
+4. MCP 工具统一经过 middleware 校验 + Trace 埋点
+5. 提供 MCP 配置、测试脚本
 
-### 模板F：语音链路开发
-当前阶段：阶段2.5
-需求：本地语音链路 faster-whisper ASR + piper TTS
+### 模板F：图片OCR/VL路由
+当前阶段：阶段1
+需求：实现 image_ocr / image_vl 两链路 + 意图路由
 要求：
-1. backend/voice模块，录音、识别、朗读
-2. 交互：按住按钮录音，非后台持续唤醒监听
-3. ws推送：收音状态、识别文本、播报状态
-4. 适配Mac麦克风权限、Windows音频设备
-5. uv依赖 + 独立测试脚本
+1. image_ocr：OCR文字识别（本地OCR引擎）
+2. image_vl：VL多模态看图，独立开关、独立模型配置
+3. Agent 系统提示词教它区分：要读文字→OCR；要看图解析→VL
+4. VL 未开启时，识别看图意图后友好提示，不强行走 OCR 返回"无文字"
+5. 图片 base64 只在运行时传递，不入库，只存摘要文本

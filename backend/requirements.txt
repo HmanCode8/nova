@@ -1,0 +1,34 @@
+# NovaSecretary 后端依赖
+# 安装：cd backend && uv sync  (或 uv add 单个)
+
+# ==== Web 服务 ====
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+sse-starlette>=2.1.0
+websockets>=12.0
+
+# ==== 配置 ====
+pydantic>=2.7.0
+pydantic-settings>=2.2.1
+python-dotenv>=1.0.0
+
+# ==== LangGraph & LangChain 组件 ====
+langgraph>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+langchain-community>=0.2.0
+
+# ==== MCP ====
+mcp>=1.0.0
+psutil>=5.9.0
+
+# ==== 工具依赖 ====
+tavily-python>=0.3.0
+pillow>=10.0.0
+pypdf>=4.0.0
+python-docx>=1.2.0
+openpyxl>=3.1.0
+aiofiles>=23.2.1
+
+# ==== SQLite ====
+aiosqlite>=0.19.0

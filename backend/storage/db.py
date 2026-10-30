@@ -107,6 +107,73 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_plans_session ON project_plans(session_id, created_at)",
+    # ---- v2 新增（FINAL_DEVELOPMENT_DOC 第十章）----
+    """
+    CREATE TABLE IF NOT EXISTS whitelist_dirs (
+        id TEXT PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trace_log (
+        id TEXT PRIMARY KEY,
+        task_id TEXT,
+        session_id TEXT,
+        tool_name TEXT NOT NULL,
+        params TEXT,
+        result TEXT,
+        status TEXT NOT NULL,
+        duration_ms INTEGER DEFAULT 0,
+        started_at REAL DEFAULT 0,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trace_session ON trace_log(session_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trace_task ON trace_log(task_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        title TEXT NOT NULL DEFAULT '',
+        prompt TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        result TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS mcp_config (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        command TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '[]',
+        env_json TEXT NOT NULL DEFAULT '{}',
+        catalog_id TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        risk_level TEXT NOT NULL DEFAULT 'normal',
+        require_confirm INTEGER NOT NULL DEFAULT 0,
+        transport TEXT NOT NULL DEFAULT 'stdio',
+        url TEXT NOT NULL DEFAULT '',
+        headers_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_summary (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        memory_text TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_memory_summary_session ON memory_summary(session_id)",
 )
 
 
@@ -156,6 +223,35 @@ class Database:
         columns = {row[1] for row in rows}
         if "attachments_json" not in columns:
             await conn.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT")
+        if "reasoning" not in columns:
+            # 思考过程（推理模型的 reasoning_content），仅用于界面回显，不参与上下文
+            await conn.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT")
+
+        cursor = await conn.execute("PRAGMA table_info(trace_log)")
+        trace_rows = await cursor.fetchall()
+        await cursor.close()
+        trace_columns = {row[1] for row in trace_rows}
+        if "confirmed" not in trace_columns:
+            # 标记该次调用是否经过人工确认（删除类操作），最终 status 仍记为执行结果
+            await conn.execute(
+                "ALTER TABLE trace_log ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0"
+            )
+
+        cursor = await conn.execute("PRAGMA table_info(mcp_config)")
+        mcp_rows = await cursor.fetchall()
+        await cursor.close()
+        mcp_columns = {row[1] for row in mcp_rows}
+        # v2：支持 Streamable HTTP 传输与自定义请求头
+        for column, ddl in (
+            ("transport", "ALTER TABLE mcp_config ADD COLUMN transport TEXT NOT NULL DEFAULT 'stdio'"),
+            ("url", "ALTER TABLE mcp_config ADD COLUMN url TEXT NOT NULL DEFAULT ''"),
+            (
+                "headers_json",
+                "ALTER TABLE mcp_config ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+        ):
+            if column not in mcp_columns:
+                await conn.execute(ddl)
 
     async def close(self) -> None:
         if self._conn is not None:

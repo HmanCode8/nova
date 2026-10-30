@@ -20,6 +20,8 @@ from backend.env_loader import load_env
 from langchain_openai import ChatOpenAI
 
 from backend.agent.model_params import build_model_kwargs
+from backend.agent.model_profiles import get_active_profile, normalize_base_url
+from backend.agent.thinking_chat_model import ReasoningChatOpenAI
 from backend.storage.config_store import get_config
 
 load_env()
@@ -46,18 +48,30 @@ async def build_chat_model(streaming: bool = True) -> ChatOpenAI:
     """根据配置构建 ChatOpenAI 客户端；缺少 api_key 时抛出 LLMConfigError。"""
     config = await get_config()
     model_cfg = config.get("model") or {}
+    profile = await get_active_profile()
 
-    base_url = _clean(model_cfg.get("base_url")) or _clean(os.getenv("LLM_BASE_URL"))
-    model_name = _clean(model_cfg.get("model_name")) or _clean(os.getenv("LLM_MODEL_NAME"))
-    api_key = _clean(os.getenv("LLM_API_KEY"))
+    base_url = normalize_base_url(
+        _clean((profile or {}).get("base_url"))
+        or _clean(model_cfg.get("base_url"))
+        or _clean(os.getenv("LLM_BASE_URL"))
+    )
+    model_name = (
+        _clean((profile or {}).get("model_name"))
+        or _clean(model_cfg.get("model_name"))
+        or _clean(os.getenv("LLM_MODEL_NAME"))
+    )
+    env_name = _clean((profile or {}).get("api_key_env")) or "LLM_API_KEY"
+    api_key = _clean(os.getenv(env_name)) or _clean(os.getenv("LLM_API_KEY"))
     temperature = model_cfg.get("temperature", os.getenv("LLM_TEMPERATURE", 0.7))
 
     if not base_url:
-        raise LLMConfigError("未配置 LLM_BASE_URL，请在设置面板或 .env 中填写模型服务地址。")
+        raise LLMConfigError("未配置模型服务地址，请在设置面板「模型档案」里填写 Base URL。")
     if not model_name:
-        raise LLMConfigError("未配置模型名称，请在设置面板或 .env 中填写 model_name。")
+        raise LLMConfigError("未配置模型名称，请在设置面板「模型档案」里填写模型名。")
     if not api_key:
-        raise LLMConfigError("未配置 LLM_API_KEY，请在 backend/.env 中填写模型密钥后重启后端。")
+        raise LLMConfigError(
+            f"未配置模型密钥：请在设置面板「模型档案」里填写 API Key（写入 .env 的 {env_name}）。"
+        )
 
     try:
         temperature_value = float(temperature)
@@ -65,7 +79,7 @@ async def build_chat_model(streaming: bool = True) -> ChatOpenAI:
         temperature_value = 0.7
 
     http_client = local_http_client(base_url)
-    return ChatOpenAI(
+    return ReasoningChatOpenAI(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
@@ -74,7 +88,7 @@ async def build_chat_model(streaming: bool = True) -> ChatOpenAI:
         timeout=60,
         streaming=streaming,
         **({"http_async_client": http_client} if http_client else {}),
-        **build_model_kwargs(model_cfg),
+        **build_model_kwargs(model_cfg, base_url),
     )
 
 

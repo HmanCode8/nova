@@ -3,7 +3,7 @@ backend/.venv/
 __pycache__/
 *.py[cod]
 backend/.env
-
+/z_test
 # ===== Node / Electron =====
 frontend-electron/node_modules/
 frontend-electron/dist/

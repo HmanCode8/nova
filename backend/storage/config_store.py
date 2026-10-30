@@ -15,6 +15,10 @@ from backend.storage.db import db
 
 # 默认配置：新增字段时旧库自动补齐
 DEFAULT_CONFIG: dict[str, Any] = {
+    # 自主模式：开启后除删除（与破坏性命令）外不再逐步人工确认；用户明确授权
+    "autonomy_mode": True,
+    # 命令执行开关（run_shell）
+    "shell_enabled": True,
     "web_search_enabled": True,
     "auto_memory_enabled": True,
     "tts_enabled": True,
@@ -33,6 +37,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_file_size_mb": 10,
     "confirm_timeout_seconds": 180,
     "max_context_tokens": 6000,
+    # 后台任务（Runtime 层）：并发上限与单任务超时回收
+    "max_concurrent_tasks": 2,
+    "task_timeout_seconds": 900,
     "model": {
         "base_url": "https://api.deepseek.com/v1",
         "model_name": "deepseek-chat",
@@ -60,17 +67,27 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 async def get_config() -> dict[str, Any]:
-    """读取当前配置，与默认值合并后返回。"""
+    """读取当前配置，与默认值合并后返回。
+
+    allowed_dirs 以白名单表为准（whitelist_dirs），保证「设置面板看到的」与
+    「中间件实际校验的」永远一致。
+    """
     row = await db.fetch_one("SELECT config_json FROM app_config ORDER BY id LIMIT 1")
     if row is None:
-        return copy.deepcopy(DEFAULT_CONFIG)
+        merged = copy.deepcopy(DEFAULT_CONFIG)
+    else:
+        try:
+            stored = json.loads(row["config_json"])
+        except (TypeError, json.JSONDecodeError):
+            stored = {}
+        merged = _deep_merge(DEFAULT_CONFIG, stored if isinstance(stored, dict) else {})
     try:
-        stored = json.loads(row["config_json"])
-    except (TypeError, json.JSONDecodeError):
-        return copy.deepcopy(DEFAULT_CONFIG)
-    if not isinstance(stored, dict):
-        return copy.deepcopy(DEFAULT_CONFIG)
-    return _deep_merge(DEFAULT_CONFIG, stored)
+        from backend.storage import whitelist_store  # 延迟导入避免循环依赖
+
+        merged["allowed_dirs"] = await whitelist_store.list_dirs()
+    except Exception:  # 白名单读取失败时退回 JSON 里的旧值，不影响对话
+        pass
+    return merged
 
 
 async def save_config(patch: dict[str, Any]) -> dict[str, Any]:
@@ -81,6 +98,14 @@ async def save_config(patch: dict[str, Any]) -> dict[str, Any]:
     if isinstance(patch_model, dict) and "extra_body" in patch_model:
         body = patch_model.get("extra_body")
         merged.setdefault("model", {})["extra_body"] = dict(body) if isinstance(body, dict) else {}
+    # 白名单双写：表是权威来源，JSON 里同步一份便于导出/排障
+    if isinstance(patch, dict) and isinstance(patch.get("allowed_dirs"), list):
+        from backend.storage import whitelist_store  # 延迟导入避免循环依赖
+
+        try:
+            merged["allowed_dirs"] = await whitelist_store.replace_all(patch["allowed_dirs"])
+        except Exception:
+            pass
     payload = json.dumps(merged, ensure_ascii=False)
     row = await db.fetch_one("SELECT id FROM app_config ORDER BY id LIMIT 1")
     if row is None:

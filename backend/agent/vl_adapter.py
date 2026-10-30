@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from backend.agent.llm_adapter import image_content_part, local_http_client
+from backend.agent.model_profiles import normalize_base_url, resolve_capable_profile
 from backend.storage.config_store import get_config
 
 DEFAULT_QUESTION = "请详细描述这张图片：画面内容、界面布局、关键元素，以及能看出的结构或流程。"
@@ -43,13 +44,26 @@ def _text_of(content: object) -> str:
     return str(content or "")
 
 
-def vision_settings(config: dict) -> tuple[str, str, str]:
-    """返回 (base_url, model_name, api_key)；缺配置时抛 VLConfigError。"""
+async def vision_settings(config: dict) -> tuple[str, str, str]:
+    """返回 (base_url, model_name, api_key)；缺配置时抛 VLConfigError。
+
+    优先使用「勾选了可看图」的模型档案（当前激活档案优先），
+    其次回落到旧版 vision_source（main / separate）配置。
+    """
+    profile = await resolve_capable_profile("vision")
+    if profile:
+        base_url = normalize_base_url(profile.get("base_url"))
+        model_name = str(profile.get("model_name") or "").strip()
+        env_name = str(profile.get("api_key_env") or "LLM_API_KEY")
+        api_key = (os.getenv(env_name) or os.getenv("LLM_API_KEY") or "").strip()
+        if base_url and model_name and (api_key or base_url.startswith(_LOCAL_HOSTS)):
+            return base_url, model_name, api_key or "ollama"
+
     source = str(config.get("vision_source") or "main").strip().lower()
 
     if source != "separate":
         model_cfg = config.get("model") or {}
-        base_url = str(model_cfg.get("base_url") or os.getenv("LLM_BASE_URL") or "").strip()
+        base_url = normalize_base_url(model_cfg.get("base_url") or os.getenv("LLM_BASE_URL") or "")
         model_name = str(model_cfg.get("model_name") or os.getenv("LLM_MODEL_NAME") or "").strip()
         api_key = (os.getenv("LLM_API_KEY") or "").strip()
         if not base_url or not model_name:
@@ -60,7 +74,7 @@ def vision_settings(config: dict) -> tuple[str, str, str]:
             raise VLConfigError("主模型缺少密钥：请在 .env 中填写 LLM_API_KEY。")
         return base_url, model_name, api_key or "ollama"
 
-    base_url = str(config.get("vl_base_url") or os.getenv("VL_BASE_URL") or "").strip()
+    base_url = normalize_base_url(config.get("vl_base_url") or os.getenv("VL_BASE_URL") or "")
     model_name = str(config.get("vl_model_name") or os.getenv("VL_MODEL_NAME") or "").strip()
     api_key = (os.getenv("VL_API_KEY") or "").strip()
     if not base_url or not model_name:
@@ -76,7 +90,7 @@ async def describe_image(path: Path, question: str = "") -> str:
     if not config.get("vl_enabled"):
         raise VLConfigError("当前已关闭视觉理解，仅支持图片 OCR 文字识别。")
 
-    base_url, model_name, api_key = vision_settings(config)
+    base_url, model_name, api_key = await vision_settings(config)
 
     content = [
         {"type": "text", "text": (question or "").strip() or DEFAULT_QUESTION},

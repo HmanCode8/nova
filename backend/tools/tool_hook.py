@@ -11,21 +11,77 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# 带副作用、必须人工确认的工具（04-security / 08-human-confirm）
+# 工具命名对齐（FINAL_DEVELOPMENT_DOC 第六章）：对外统一用文档命名，
+# 旧名保留为别名继续可执行，这里负责在中间件入口做归一化。
+LEGACY_TOOL_NAMES: dict[str, str] = {
+    "read_file": "file_read",
+    "write_file": "file_write",
+    "open_local_file": "file_open",
+    "delete_file": "file_delete",
+    "ocr_image": "image_ocr",
+    "take_screenshot": "screen_capture",
+    "tavily_web_search": "tavily_search",
+    "run_shell": "shell_run",
+}
+
+
+def canonical_tool_name(name: str) -> str:
+    """把旧工具名归一化为文档规定的新名字。"""
+    return LEGACY_TOOL_NAMES.get(name, name)
+
+
+# 带副作用、需要策略判定的工具：是否真的弹确认由 needs_confirmation 决定
 SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
-    {"write_file", "write_project_files", "open_local_file", "email_send", "calendar_create"}
+    {
+        "file_write",
+        "write_project_files",
+        "file_open",
+        "email_send",
+        "calendar_create",
+        "file_delete",
+        "shell_run",
+    }
 )
+
+# 自主模式（autonomy_mode）下仍然强制确认的工具：删除是唯一兜底红线
+ALWAYS_CONFIRM_TOOLS: frozenset[str] = frozenset({"file_delete"})
+
+# 破坏性命令：自主模式下自动降级为人工确认（等价于删除级风险）
+DANGEROUS_COMMAND_PATTERNS = re.compile(
+    r"(rm\s+-[a-z]*[rf]|remove-item\s+.*-recurse|\bdel\s+/[fsq]|\brd\s+/s|\brmdir\s+/s"
+    r"|format\s+[a-z]:|diskpart|shutdown|restart-computer|stop-computer|mkfs|dd\s+if="
+    r"|reg\s+delete|bcdedit|vssadmin|cipher\s+/w|\bnet\s+user\b|\bnet\s+localgroup\b"
+    r"|wmic\s+.*delete|takeown|icacls\s+.*(/reset|/grant))",
+    re.IGNORECASE,
+)
+
+
+def is_dangerous_command(command: str) -> bool:
+    """明显破坏性命令（删盘/关机/改系统账户/格式化）判定。"""
+    return bool(DANGEROUS_COMMAND_PATTERNS.search(command or ""))
+
+
+async def autonomy_enabled() -> bool:
+    """自主模式开关（设置面板可关，关掉恢复逐步确认）。"""
+    try:
+        from backend.storage.config_store import get_config  # 延迟导入避免循环依赖
+
+        config = await get_config()
+        return bool(config.get("autonomy_mode", True))
+    except Exception:
+        return False
 
 # 项目模式批量写入上限：一批一次确认，避免单次 state 过大
 MAX_BATCH_FILES = 10
 MAX_BATCH_CHARS = 200_000
 
-# 可执行/脚本后缀黑名单：只读不拦，写入与打开一律拦截
+# 可执行后缀黑名单：用于「打开文件」，只读不拦
 EXECUTABLE_SUFFIXES: frozenset[str] = frozenset(
     {
         ".exe", ".bat", ".cmd", ".ps1", ".psm1", ".com", ".msi", ".scr",
@@ -34,17 +90,34 @@ EXECUTABLE_SUFFIXES: frozenset[str] = frozenset(
     }
 )
 
+# 写入侧黑名单：只拦真正的二进制可执行格式，源码/脚本（.js/.ts/.py/.sh/.bat/.ps1）放行
+WRITE_BLOCKED_SUFFIXES: frozenset[str] = frozenset(
+    {".exe", ".com", ".msi", ".scr", ".cpl", ".pif", ".dll", ".sys", ".drv", ".lnk"}
+)
+
+
+def is_write_blocked_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in WRITE_BLOCKED_SUFFIXES
+
 
 class ToolValidationError(ValueError):
     """工具硬校验不通过：直接返回错误给 Agent，不弹人工确认。"""
 
 
 
-async def needs_confirmation(tool_name: str) -> bool:
-    """是否需要人工确认：固定副作用工具 + 可配置的视觉理解工具。"""
-    if tool_name in SIDE_EFFECT_TOOLS:
+async def needs_confirmation(tool_name: str, args: dict[str, Any] | None = None) -> bool:
+    """是否需要人工确认：自主模式下一律放行，删除与破坏性命令除外。"""
+    args = args or {}
+    name = canonical_tool_name(tool_name)
+    if name in ALWAYS_CONFIRM_TOOLS:
         return True
-    if tool_name == "image_vl":
+    if name == "shell_run":
+        if not await autonomy_enabled():
+            return True
+        return is_dangerous_command(str(args.get("command") or ""))
+    if name in SIDE_EFFECT_TOOLS:
+        return not await autonomy_enabled()
+    if name == "image_vl":
         try:
             from backend.storage.config_store import get_config  # 延迟导入避免循环依赖
 
@@ -60,11 +133,12 @@ def new_confirm_id() -> str:
 
 
 def _preview_for(tool_name: str, args: dict[str, Any]) -> str:
-    if tool_name == "write_file":
+    name = canonical_tool_name(tool_name)
+    if name == "file_write":
         path = args.get("file_path") or args.get("path") or "（未提供路径）"
         content = str(args.get("content", ""))
         return f"即将写入文件：{path}（{len(content)} 字符，将覆盖原内容）"
-    if tool_name == "write_project_files":
+    if name == "write_project_files":
         files = args.get("files") if isinstance(args.get("files"), list) else []
         entries = [item for item in files if isinstance(item, dict)]
         names = [str(item.get("path") or "（未命名）") for item in entries]
@@ -74,13 +148,20 @@ def _preview_for(tool_name: str, args: dict[str, Any]) -> str:
             f"即将写入 {len(names)} 个文件到 {args.get('root_dir') or '（未提供目录）'}："
             f"{shown}（合计 {total} 字符，同名文件将被覆盖）"
         )
-    if tool_name == "open_local_file":
+    if name == "file_open":
         path = args.get("file_path") or args.get("path") or "（未提供路径）"
         return f"即将用系统默认程序打开文件：{path}"
-    if tool_name == "email_send":
+    if name == "email_send":
         return f"即将发送邮件：收件人 {args.get('to', '（未提供）')}，主题 {args.get('subject', '（无主题）')}"
-    if tool_name == "calendar_create":
+    if name == "calendar_create":
         return f"即将新建日程：{args.get('title', '（无标题）')}，时间 {args.get('start_time', '（未提供）')}"
+    if name == "file_delete":
+        target = args.get("path") or args.get("file_path") or "（未提供路径）"
+        suffix = "（递归删除目录内全部内容）" if args.get("recursive") else ""
+        return f"高风险：即将永久删除 {target}{suffix}，删除后无法恢复"
+    if name == "shell_run":
+        command = str(args.get("command") or "（未提供命令）")
+        return f"即将执行命令（可能破坏数据，请仔细核对）：{command}"
     return f"即将执行高副作用操作：{tool_name}"
 
 
@@ -177,6 +258,8 @@ async def ensure_path_allowed(path_str: str, *, must_exist: bool = False) -> Pat
         raise ToolValidationError(f"请使用绝对路径：{raw}")
 
     resolved = path.resolve(strict=False)
+
+    # 白名单是兜底防线（FINAL_DEVELOPMENT_DOC 第二章）：无论自主模式是否开启都必须校验
     allowed = await get_allowed_dirs()
     if not allowed:
         raise ToolValidationError(
@@ -207,15 +290,39 @@ async def ensure_readable_file(path_str: str, max_size_mb: int = 10) -> Path:
 
 
 async def ensure_writable_file(path_str: str) -> Path:
-    """写入工具校验：授权目录内、非可执行后缀、父目录必须已存在。"""
+    """写入工具校验：白名单内、非二进制可执行后缀；缺失的父目录自动创建。"""
     path = await ensure_path_allowed(path_str)
-    if is_executable_path(path):
-        raise ToolValidationError(f"安全限制：禁止写入可执行文件后缀 {path.suffix}：{path}")
+    if is_write_blocked_path(path):
+        raise ToolValidationError(f"安全限制：禁止写入二进制可执行文件后缀 {path.suffix}：{path}")
     if not path.parent.exists():
-        raise ToolValidationError(f"目标目录不存在，请先创建目录：{path.parent}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolValidationError(f"无法创建父目录 {path.parent}：{exc}") from exc
     if path.exists() and path.is_dir():
         raise ToolValidationError(f"目标是目录，不能写入：{path}")
     return path
+
+
+SYSTEM_ROOT = Path(os.getenv("SystemRoot") or r"C:\Windows")
+
+
+def _is_protected_path(path: Path) -> bool:
+    """系统关键目录 / 应用数据目录禁止删除（删掉会直接崩系统或丢数据库）。"""
+    from backend.storage.db import APP_DATA_DIR  # 延迟导入避免循环依赖
+
+    protected = [SYSTEM_ROOT, SYSTEM_ROOT / "System32", APP_DATA_DIR.resolve()]
+    return any(_is_within(path, item) for item in protected)
+
+
+async def ensure_deletable_path(path_str: str) -> Path:
+    """删除校验：白名单内、必须存在、禁止盘符根目录与系统/应用数据目录。"""
+    resolved = await ensure_path_allowed(path_str, must_exist=True)
+    if resolved.parent == resolved:
+        raise ToolValidationError(f"安全限制：禁止删除盘符根目录 {resolved}")
+    if _is_protected_path(resolved):
+        raise ToolValidationError(f"安全限制：禁止删除系统或应用数据目录 {resolved}")
+    return resolved
 
 
 async def ensure_openable_file(path_str: str) -> Path:
@@ -235,7 +342,7 @@ async def ensure_project_batch(
 
     - 相对路径按 root_dir 拼接，自动建父目录交给调用方执行
     - 绝对路径也必须在 root_dir 内，防止借批量写绕过白名单
-    - 复用可执行后缀黑名单 + 单批文件数/总字符上限
+    - 复用写入侧后缀黑名单（仅拦二进制可执行格式）+ 单批文件数/总字符上限
     """
     if not isinstance(files, list) or not files:
         raise ToolValidationError("files 不能为空，请提供 [{path, content}] 列表。")
@@ -265,9 +372,9 @@ async def ensure_project_batch(
         resolved = await ensure_path_allowed(str(target))
         if not _is_within(resolved, root):
             raise ToolValidationError(f"文件必须位于项目根目录内：{resolved}")
-        if is_executable_path(resolved):
+        if is_write_blocked_path(resolved):
             raise ToolValidationError(
-                f"安全限制：禁止写入可执行文件后缀 {resolved.suffix}：{resolved}"
+                f"安全限制：禁止写入二进制可执行文件后缀 {resolved.suffix}：{resolved}"
             )
         if resolved.exists() and resolved.is_dir():
             raise ToolValidationError(f"目标是目录，不能写入：{resolved}")
@@ -326,14 +433,26 @@ async def hard_validate(tool_name: str, args: dict[str, Any]) -> str | None:
 
     返回错误文案表示直接拒绝且不弹确认；返回 None 表示可以进入确认流程。
     """
+    name = canonical_tool_name(tool_name)
     try:
-        if tool_name == "write_file":
+        if name == "file_write":
             await ensure_writable_file(str(args.get("file_path") or ""))
-        elif tool_name == "write_project_files":
+        elif name == "write_project_files":
             await ensure_project_batch(str(args.get("root_dir") or ""), args.get("files"))
-        elif tool_name == "open_local_file":
+        elif name == "file_open":
             await ensure_openable_file(str(args.get("file_path") or ""))
-        elif tool_name == "email_send":
+        elif name == "file_delete":
+            await ensure_deletable_path(str(args.get("path") or args.get("file_path") or ""))
+        elif name == "shell_run":
+            command = str(args.get("command") or "").strip()
+            if not command:
+                return "命令不能为空。"
+            if len(command) > 4000:
+                return "命令过长（上限 4000 字符）。"
+            cwd = str(args.get("cwd") or "").strip()
+            if cwd and not Path(cwd).expanduser().is_dir():
+                return f"工作目录不存在：{cwd}"
+        elif name == "email_send":
             to = str(args.get("to") or "").strip()
             subject = str(args.get("subject") or "").strip()
             body = str(args.get("body") or "").strip()

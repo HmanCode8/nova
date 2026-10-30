@@ -2,7 +2,7 @@
 
 边界（方案 A）：
 - 只做计划编排与文件产出，不执行命令、不跑测试
-- 批量写文件仍走人工确认（gate 节点 interrupt），一次确认一批
+- 自主模式下批量写文件直接执行；关闭自主模式时由 gate 节点 interrupt 确认
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ async def update_project_step(step: int, status: str, note: str = "") -> str:
 
 @tool
 async def write_project_files(root_dir: str, files: list[dict[str, str]]) -> str:
-    """批量写入项目文件（带人工确认，用户确认后一次写入整批；自动创建父目录）。
+    """批量写入项目文件（自主模式直接写入；关闭自主模式需确认后整批写入；自动创建父目录）。
 
     参数:
         root_dir: 项目根目录绝对路径（必须在授权目录内）

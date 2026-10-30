@@ -1,321 +1,339 @@
-# NovaSecretary — 最终完整开发方案主文档
-> 版本：v1.0 终稿 ｜ 交付给 TRAE SOLO 作为开发基线
-> 定位：**Mac + Windows 双桌面私人 AI 秘书**，语音/文字双输入、联网搜索、本地文档代码处理、邮件日历查询、悬浮宠物、炫酷科技UI。
+# NovaSecretary — 最终完整开发方案主文档（v2 自主执行生产 Agent）
+> 版本：v2.0 ｜ 交付给 TRAE SOLO 作为开发基线
+> 定位：**跨平台（Windows + Mac）桌面自主执行 AI 生产 Agent**
+> 一句话：Agent 可自主操作本机电脑，自由读写/新建/修改/打开文件、执行命令、联网、调 MCP 帮你完成任务；**仅文件删除必须人工确认**；全部动作留轨迹；内置 MCP 商店自由扩展。
 
 ---
 
-## 一、项目一句话定位
-常驻桌面的私人 AI 助理：随时唤起（悬浮宠/快捷键）、可语音可打字、能读你授权的文档和代码、能帮你查邮件和日程、能联网查资料，像一个贴身工作秘书；数据默认本地留存、敏感操作需你确认。
+## 一、项目定位
+常驻桌面的自主生产 Agent：
+- 帮你开发项目、做 UI 原型、整理文档、查资料、处理文件，Agent 可以连续多轮自主执行直到产出交付物
+- 平时当个人助理，需要的时候切到生产模式，让 Agent 在你本机工作目录自由干活
+- 数据本地存储，不上传；删除操作强确认
 
 ---
 
-## 二、需求梳理（用户原始诉求 + 我们确认的边界）
-
-### 核心能力（MVP 要做）
-1. **对话**：文字对话 + 按住麦克风语音对话（不做后台持续唤醒监听）
-2. **LLM**：OpenAI 兼容协议，可切换 Ollama 本地模型 / DeepSeek / 其他支持 Function Call 的模型
-3. **联网搜索**：Tavily，设置面板一键开关，关闭后工具不可调用
-4. **文档与代码**：读取/写入本地 txt/md/代码文件；辅助写代码、排查报错、解释工程、生成 prompt/skill/开发文档
-5. **系统工具**：剪贴板读写、截图+OCR识别截图、调用系统默认程序打开本地文档（人工确认后执行）
-6. **邮件日历（MCP）**：查今日邮件摘要、读单封邮件、查今日日程；发送邮件/新建日程属于带副作用操作，人工确认后才执行
-7. **记忆**：多会话隔离、会话内上下文、长期偏好记忆（记住编码习惯、文档格式偏好）
-8. **UI**：科技深色对话面板（粒子背景、音频波形、卡片结果）+ 桌面悬浮宠物（idle/thinking/done 三套 Lottie 动画）
-9. **全局快捷键**：Windows `Alt+Space`；macOS `Option+Space`
-10. **托盘后台常驻**，关闭窗口后后台保持运行
-11. **人工确认机制**：所有带副作用工具（写文件、打开文档、发邮件、新建日程）执行前暂停 Agent，推送确认卡片，你确认后才执行
-
-### 明确不做（MVP 及任何阶段，防止无限扩展）
-- ❌ 账号登录、云端同步、多人协作
-- ❌ 自动发送/自动回复邮件（必须人工确认）
-- ❌ 无限制 GUI 自动点击自动化（pyautogui）
-- ❌ 爬虫工具
-- ❌ 复杂 Word/Excel 解析（优先 md/txt/代码文本）
-- ❌ OSS 云存储（仅想法，不实现）
-
-### 后续扩展（MVP 稳定后再做）
-- 本地知识库 RAG
-- 更多 MCP 连接器（飞书、Notion）
-- 唤醒词语音监听（后置）
-- 语音确认替代鼠标点击确认
-
----
-
-## 三、技术选型（已敲定）
-| 层次 | 选型 | 说明 |
+## 二、权限模型（核心，最关键）
+| 操作 | 权限 | 说明 |
 |---|---|---|
-| 桌面端 | Electron + Vue3 + Vite | 前端壳，先验证，稳定后可迁移 Tauri2 |
-| 后端 | Python FastAPI + Uvicorn | ASGI 异步，WebSocket 流式通信，仅本地 127.0.0.1 |
-| Agent编排 | LangGraph 原生 StateGraph + create_react_agent | 手写节点，白盒可控 |
-| 模型适配 | 少量 LangChain 组件（ChatOpenAI、@tool、消息对象） | 统一 OpenAI 兼容协议 |
-| 存储 | SQLite + aiosqlite | 全异步，本地单文件 |
-| 语音 | faster-whisper（ASR）+ piper（TTS） | 本地处理，不上传 |
-| 工具协议 | MCP（邮件/日历） | OAuth 授权，高危确认 |
+| 读取文件 | ✅ 放行 | 白名单目录内自由读取 |
+| 新建/编辑/写文件 | ✅ 放行 | 直接执行，不需 Diff 确认 |
+| 打开文件 | ✅ 放行 | 调用系统程序打开 |
+| 截屏 | ✅ 放行 | 截图送入 OCR/VL |
+| 执行命令 | ✅ 放行 | 白名单目录内 PowerShell/Shell |
+| 联网搜索 | ✅ 放行 | Tavily，开关可控 |
+| 调用 MCP | ✅ 放行 | 已安装 MCP 工具自动调用 |
+| 剪贴板 | ✅ 放行 | 读取剪贴板 |
+| **删除文件/文件夹** | ⛔ **强制确认** | 流程中断，点击/语音确认后才执行 |
 
-### 明确不引入
-- ❌ LangChain `agents.middleware` 高层中间件（改用原生 interrupt，效果一致、控制力更高）
-- ❌ LangGraph Store（记忆用自研 SQLite）
-- ❌ LangSmith（会上传 trace，MVP 不接入）
-- ❌ Redis / MQ / Nginx / Celery 等重型中间件
-- ❌ OSS 云存储
+> 兜底防线：**目录白名单**。Agent 只能访问你配置的根目录范围，无法触碰白名单外的系统敏感路径。
+> 允许范围：用户可手动配置允许 Agent 访问的文件夹；白名单之外一律拒绝。
 
 ---
 
-## 四、架构总览（前后端严格分离）
+## 三、界面方案
+### 1. 形态双入口
+1. **桌面悬浮球**（常驻）：科技粒子 UI、全局快捷键唤醒、全局语音开关，随时唤起主工作台
+2. **三栏工作台窗口**（主界面），面板可拖拽缩放、单独收起
+   - 左栏：资讯雷达（数据源来自 MCP：RSS/资讯/邮件，分类标签、星标收藏、【放入问题】一键带入对话）
+   - 中间主区：对话流 + 后台任务卡片（深度调研/开发任务，实时输出日志，可手动停止）
+   - 右栏：自定义数据看板（卡片组件，数据由 MCP 提供，可自由增删组件）
+
+### 2. 轨迹 Trace 面板（重点）
+- 独立 Tab，时序时间线（甘特样式），展示全部工具调用
+- 每条记录：工具名称、调用参数、返回结果、耗时、执行时间
+- 支持搜索、展开详情，完整回放 Agent 每一步动作
+
+### 3. 顶部全局导航
+对话 / 轨迹 / 我的关注 / 它对我的了解 / 全局语音开关
+
+### 4. 语音交互
+- 全局常驻语音开关，随时语音下达指令，支持连续对话、语音打断
+- ASR 语音转文字、TTS 语音播报
+
+---
+
+## 四、后端四层架构
 ```
-Electron+Vue3(UI/窗口/热键/托盘/麦克风)
-        │  WebSocket + HTTP
-        ▼
-FastAPI 后端 (127.0.0.1:8000)
-  ├─ WebSocket事件网关（协议转换/分发/流式推送）
-  ├─ Graph前置节点（记忆注入/token检查/摘要）
-  ├─ LangGraph ReAct 图
-  │     └─ interrupt() 人工确认
-  ├─ 统一工具钩子 tool_hook（校验/确认/截断）
-  ├─ 各 @tool 工具
-  ├─ llm_adapter（模型适配/重试/图片base64）
-  ├─ storage（SQLite 持久化适配层）
-  └─ mcp_client（MCP stdio 适配器）
+Runtime 任务运行时层
+│  任务生命周期管理：启动/停止/暂停/超时回收
+│  任务上下文隔离、并发控制
+│  LangGraph 实例管理、MemorySaver 断点快照
+├─ Middleware 中间件层
+│  LLM链路中间件：Token统计、提示词注入
+│  工具链路中间件：白名单校验、删除动作拦截、Trace埋点、异常捕获
+├─ Core Agent 单智能体核心（LangGraph）
+│  消息循环、工具路由、interrupt 删除确认断点
+│  内置原生工具集 + MCP工具适配
+└─ MCP 管理模块
+    MCP商店、MCP进程启停、参数配置
+    MCP工具转 BaseTool 适配器
+（Multi-Agent 多智能体调度层 = V2 扩展，MVP 不做）
 ```
 
 ---
 
-## 五、固定目录结构（严禁擅改）
+## 五、固定目录结构
 ```
 nova-secretary/
-├─ AGENTS.md                  # TRAE 全局规则
-├─ README.md                  # 使用说明
-├─ FINAL_DEVELOPMENT_DOC.md   # 本主文档
-├─ .trae/rules/               # TRAE 技能规则
+├─ AGENTS.md
+├─ FINAL_DEVELOPMENT_DOC.md
+├─ ACCEPTANCE_TEST.md
+├─ README.md
+├─ .trae/rules/
 ├─ backend/
-│  ├─ agent/                  # agent_graph.py、llm_adapter.py、context_compress.py
-│  ├─ tools/                  # tool_hook.py + 各工具
-│  ├─ storage/                # db.py、session_store.py
-│  ├─ voice/                  # asr.py、tts.py
-│  ├─ mcp_client/
+│  ├─ runtime/          # 任务运行时
+│  ├─ middleware/       # 中间件
+│  ├─ agent/            # LangGraph 核心
+│  ├─ tools/            # 内置工具
+│  ├─ mcp_manager/      # MCP 商店与管理
+│  ├─ storage/          # SQLite
+│  ├─ voice/            # ASR/TTS
 │  ├─ server.py
 │  ├─ pyproject.toml
 │  └─ .env
-├─ frontend-electron/         # Electron + Vue3
-├─ assets/                    # Lottie动画、图标
+├─ frontend/            # Tauri + Vue3
+│  ├─ src/
+│  │  ├─ floating-ball/
+│  │  ├─ workbench/
+│  │  ├─ trace/
+│  │  ├─ mcp-store/
+│  │  ├─ settings/
+│  │  └─ voice/
+│  └─ src-tauri/
 └─ docs/
 ```
 
 ---
 
-## 六、全部 Agent 工具清单（MVP）
-### 文件类
-- `read_file`：读授权目录文本/代码文件（只读）
-- `write_file`：写入文本文件（人工确认）
-- `list_dir`：浏览授权目录
-- `open_local_file`：系统默认程序打开本地文档（白名单校验 + 可执行后缀黑名单 + 人工确认）
+## 六、Agent 内置工具清单
+> 所有工具统一经过 Middleware（Trace 埋点、白名单校验、删除拦截）
 
-### 网络
-- `tavily_web_search`：联网搜索（受联网开关控制）
+### 文件工具
+- `file_read`：读取本地文件（txt/md/pdf/docx/xlsx/代码），白名单内
+- `file_write` / `file_edit`：新建、增量修改文件，直接执行
+- `file_open`：调用系统程序打开文件，直接执行
+- `file_delete`：删除文件/文件夹，**唯一强制确认项**
 
-### 剪贴板
-- `clipboard_read` / `clipboard_write`
+### 图片工具（两条独立链路）
+- `image_ocr`：OCR 提取图片文字（截图/附件/扫描件）
+- `image_vl`：多模态视觉理解，解析 UI/流程图/草图/画面；独立开关，Agent 自动判断意图路由；VL 关闭时友好提示，不强行走 OCR
+- `screen_capture`：截屏，直接执行，截图送入 VL/OCR
 
-### 截图 OCR
-- `take_screenshot` / `ocr_image`
+### 联网与系统
+- `tavily_search`：联网搜索，开关可控
+- `clipboard_read`：读取剪贴板，可选开关
+- `shell_run`：白名单目录内执行 PowerShell/Shell
+- `present`：汇总当前任务产出文件清单，输出交付物列表
 
-### MCP 邮件日历
-- `email_list_today` / `email_read_detail` / `calendar_list_today` / `email_send`(确认) / `calendar_create`(确认)
+---
+
+## 七、MCP 商店
+1. MCP 商店页面：浏览、安装、卸载、配置 MCP 服务
+2. MCP 能力约定：
+   - MCP 只负责拉取原始数据、返回资源路径；**文件解析、图片识别交给内置工具**，MCP 不做解析逻辑
+   - 支持配置每个 MCP 的启动参数、环境变量（用户自定义 MCP 服务）
+   - 已安装 MCP 自动注册为 Agent 工具，Agent 自主调用
+   - 示例：邮件 MCP、日历 MCP、RSS 资讯 MCP、行情 MCP、GitHub MCP
+3. MCP 调用权限：放行，Agent 自主调用
+4. 技术：官方 Python `mcp` SDK；MCP 工具包装成 LangChain BaseTool 接入 LangGraph
+
+---
+
+## 八、LangGraph Agent 编排
+### 两种任务形态自动识别
+1. 普通问答：单次工具调用，快速响应
+2. 深度任务：识别调研/开发/设计需求，自动创建后台长任务，Agent 自主链式调用工具持续迭代，持续输出日志，可随时停止
+
+### Graph 节点流程
+```
+START → 思考规划节点 → 路由判断
+  ├─ 无工具调用 → 输出回答 → END
+  └─ 有工具 → 工具中间件
+       ├─ 写入 Trace 开始日志
+       ├─ 校验白名单路径
+       ├─ 判断是否 file_delete
+       │    ├─ 是：interrupt() 中断，返回待确认状态 → 前端弹窗 → 确认后 resume()
+       │    └─ 否：放行执行工具
+       ├─ 工具执行（内置/MCP）
+       └─ 写入 Trace 结束日志 → 回到思考规划节点（循环）
+```
+- 用 `interrupt()` + `MemorySaver` 实现删除确认断点（LangGraph 原生能力）
+- 异步 `astream` 适配 FastAPI 流式输出
+- 多轮循环支持自主长任务
 
 ### 记忆
-- `add_session_memory` / `delete_session_memory` / `add_global_memory` / `delete_global_memory`
+- 会话记忆 + 长期摘要记忆，SQLite 存储
+- 自动 token 压缩；图片 base64 只在运行时传递，数据库只存摘要文本
 
-### 上传文件配套
-- `read_uploaded_file`（仅会话临时目录）/ `list_uploaded_files`
-
-### 上下文与会话
-- `create_new_session` / `summarize_context`
-
-### 扩展工具（MVP 后开发，禁止提前实现）
-run_shell、git系列、open_browser、open_local_app、pdf_read、excel_read_simple、local_kb_search、audio_transcribe_local
+### 模型
+- OpenAI 兼容协议（ChatOpenAI 统一封装）
+- 文本模型 + VL 视觉模型分开配置；支持 Ollama 本地 / DeepSeek / OpenAI
 
 ---
 
-## 七、人工确认交互（Human-in-the-loop）
-**技术实现**：LangGraph 原生 `interrupt()` + checkpointer（不用 langchain.agents.middleware）
-- 适用：write_file / open_local_file / email_send / calendar_create
-- 流程：
-  1. Agent 调用带副作用工具
-  2. 工具钩子硬校验（白名单、后缀黑名单、参数合法性），不通过直接拒绝，不弹确认
-  3. 通过 → `interrupt()` 暂停，推送确认事件到前端（载荷轻量：动作类型+必要参数+预览文本）
-  4. 前端渲染确认卡片（鼠标点击【确认执行】/【取消】）
-  5. 确认 → 执行真实工具逻辑，结果送回 Agent 循环；取消 → 返回"用户已取消"，Agent 继续对话
-  6. 超时：3 分钟未响应自动判定取消，释放 Agent 状态
-- MVP 仅鼠标点击确认；语音确认留待语音模块完成后扩展
+## 九、后端技术栈 & LangChain 组件
+### 技术栈
+| 层次 | 选型 |
+|---|---|
+| Web | FastAPI + Uvicorn + sse-starlette |
+| 编排 | LangGraph（核心） |
+| 模型封装 | langchain-openai（ChatOpenAI） |
+| 工具 | langchain-core（@tool, BaseTool） |
+| MCP | 官方 mcp SDK |
+| 存储 | SQLite + aiosqlite |
+| 文档解析 | pypdf / python-docx / openpyxl |
+| 图片 | pillow |
+| 语音 | 前端 ASR/TTS 或后端可选 |
+| 配置 | pydantic-settings / python-dotenv |
+
+### 使用的 LangChain 组件
+1. `ChatOpenAI`（langchain-openai）：统一模型封装，文本 + VL 两个实例
+2. `TavilySearchResults`（langchain-community）：内置联网工具
+3. `SystemMessage / HumanMessage / AIMessage / ToolMessage`（langchain_core.messages）：消息结构（LangGraph 原生使用）
+4. `@tool`（langchain_core.tools）：把内置函数包装成标准工具，自动生成 JSON schema
+5. `BaseTool`：MCP 工具转接基类
+6. `ChatPromptTemplate / PromptTemplate`：系统提示词模板
+7. `RunnableConfig`：传递会话ID、trace_id、白名单等运行时配置
+
+### 明确不用的 LangChain 内容
+- ❌ 旧版 Agent（OpenAIToolsAgent / AgentExecutor）→ 编排交给 LangGraph
+- ❌ LangChain RAG 全套（Chroma/FAISS）→ 当前无知识库需求
+- ❌ LangSmith → 我们用自研本地 Trace
+- ❌ LangChain 记忆类（ConversationBufferMemory 等）→ 记忆自研 SQLite
+- ❌ 复杂 Chain → 流程交给 LangGraph
 
 ---
 
-## 八、Content / State / Store 边界（防 token 爆炸核心）
-### 概念
-- **Content**：消息内文本数据字段（BaseMessage.content），是数据，不是容器
-- **State**：LangGraph 图运行时容器（内存级），核心 key 是 messages，跟随图循环传给 LLM
-- **Store**：LangGraph 内置 KV 长期存储 → **MVP 不用**，记忆走自研 SQLite
-
-### 流转铁律
-1. 长期记忆 ≠ State：需要才加载进 State，用完不长期霸占
-2. 原始文件大 content：生命周期 = 单次工具调用 → 本轮 State 临时使用；不绑定会话历史
-3. 工具返回长内容写入持久化前自动摘要压缩；summarize_context 定期压缩久远对话
-4. 图片 base64：仅在调用多模态模型瞬间临时构造，推理结束即丢弃，只存摘要+file_id
-5. 会话重启：State 由 SQLite 精简摘要初始化，不自动回填历史全文/base64
-6. 人工确认事件载荷轻量化，不携带大文本
-
-### Runtime 约束
-- 文件读取/搜索/邮件返回的长文本，允许临时进入 ToolMessage 供本轮推理，但设单次读取上限
-- 入库持久化消息前执行摘要压缩，不还原完整原文
-- State 设置全局 token 软上限，接近阈值自动触发上下文压缩
+## 十、数据存储
+### SQLite 表
+- sessions：会话
+- messages：消息记录
+- memory_summary：记忆摘要
+- trace_log：工具调用轨迹（Trace 面板数据源）
+- mcp_config：MCP 配置
+- whitelist_dirs：白名单目录
+- app_config：系统配置
+- tasks：后台任务状态
+### 约束
+- 密钥只在 .env，不入 sqlite
+- 本地存储，不上传
+- 大文件/base64 不入库，只存摘要
+- Trace 记录所有工具调用（放行 + 待确认都记录）
 
 ---
 
-## 九、自研轻量中间层（替代第三方中间件）
-| 模块 | 位置 | 作用 |
-|---|---|---|
-| WebSocket事件网关 | server.py ws路由 | 事件协议转换、分发、流式推送 |
-| Graph前置节点 | agent/agent_graph.py | 记忆注入、system组装、token检查、摘要 |
-| 工具调用钩子 | tools/tool_hook.py | 统一校验、确认识别、返回值截断、异常捕获 |
-| 消息持久化适配层 | storage/session_store.py | State 结构 ↔ SQLite 结构互转，写入瘦身 |
-| LLM 模型适配层 | agent/llm_adapter.py | OpenAI兼容封装、重试、图片base64 |
-| MCP 协议适配器 | mcp_client/ | 工具参数 ↔ MCP JSON-RPC stdio 互转 |
-
-> 原则：内联同步、职责单一、只做转换/校验/转发，不承载业务决策。
-
-### 后续扩展：自研 Middleware 规划（对标 LangChain 官方 Middleware）
-> MVP 阶段不引入 middleware 机制，能力由独立节点/钩子实现。
-> 项目稳定后可抽象一套自研中间件钩子体系，对齐 LangChain `agents.middleware` 标准点位，插拔式启用/关闭。
-
-【对齐的 LangChain 原生钩子点位】
-`before_agent → before_model → wrap_model_call → wrap_tool_call → after_model → after_agent`
-
-【计划实现的自研中间件清单】
-1. `ToolConfirmMiddleware`（挂 wrap_tool_call）— 对标 HumanInTheLoopMiddleware：副作用识别、触发 interrupt 人工确认
-2. `ContextSummarizeMiddleware`（挂 before_agent / after_model）— 对标 SummarizationMiddleware：token 统计、自动摘要压缩
-3. `ToolParamValidateMiddleware`（挂 wrap_tool_call）— 对标 ValidationMiddleware：路径白名单、后缀黑名单、参数合法性校验
-4. `RetryErrorMiddleware`（挂 wrap_model_call / wrap_tool_call）— 对标 ErrorHandlingMiddleware：LLM 重试、工具异常捕获、错误包装
-5. `LoggingMiddleware`（挂全点位）— 对标 LoggingMiddleware：全链路结构化日志
-
-> 可选第三方社区中间件（按需）：TokenCountMiddleware（token 统计）、ReadOnlyGuardMiddleware（只读/副作用工具分级）、CacheMiddleware（LLM 结果缓存，引入 Redis 时才考虑）。
-
-【设计原则】
-自研中间件只是对现有逻辑做一层抽象封装，底层仍基于 LangGraph 原生 StateGraph + interrupt，**不会切换回 create_agent 黑盒模式**；每个中间件可单独开关，插拔式组合。
-
----
-
-## 十、WebSocket 事件协议
+## 十一、WebSocket 事件协议
 前端 → 后端：
-- `{"type":"user_message","session_id":"","message":""}`
-- `{"type":"confirm_result","confirm_id":"","accepted":true/false}`
-- `{"type":"control","action":"stop"/"cancel"}`
+- `{"type":"user_message","message":""}`
+- `{"type":"confirm_result","confirm_id":"","accepted":true/false}`（删除确认）
+- `{"type":"control","action":"stop_task"}`（停止后台任务）
 
 后端 → 前端：
 - `{"type":"token","delta":""}`
 - `{"type":"tool_status","tool_name":"","status":"running"/"done"}`
-- `{"type":"human_confirm","confirm_id":"","action":"","preview_text":"","params":{}}`
+- `{"type":"delete_confirm","confirm_id":"","path":""}`（删除确认事件）
+- `{"type":"task_log","task_id":"","log":""}`
 - `{"type":"message","role":"assistant","content":""}`
 - `{"type":"error","message":""}`
 
 ---
 
-## 十一、数据存储与记忆
-### 存储
-- SQLite 单文件，路径：Windows `%APPDATA%/NovaSecretary/nova.db`；macOS `~/Library/Application Support/NovaSecretary/nova.db`
-- 表：sessions、messages、session_memory、global_memory、uploaded_file_meta、app_config
-- 密钥只在 .env，绝不入 sqlite
-- 提供导出会话、清空单会话、清空全部数据
-
-### 记忆（三类）
-- 原始对话消息（messages）+ 自动摘要压缩
-- 会话级记忆（session_memory）
-- 全局记忆（global_memory）
-- 自动记忆总开关、前端记忆管理面板（查看/编辑/删除/清空）
-- 记忆抽取由 LLM 提炼，不直接存聊天原文
-
----
-
-## 十二、文件与图片上传处理
-- Electron 系统文件选择框 → FastAPI `/upload` 接口 → 会话隔离临时目录 `temp/{session_id}/`
-- 消息只存 file_id + 摘要；需要内容时调用 read_uploaded_file 按需读取
-- 图片：推理瞬间临时 base64，用完丢弃，只存摘要+file_id
-- 清理：后端启动清理 7 天前临时文件；删除会话同步清理；MVP 单文件上限 10MB
-- 权限隔离：`read_file` 只读授权白名单目录；`read_uploaded_file` 只读会话临时目录
-
----
-
-## 十三、MVP 内置开关（设置面板）
-1. 联网开关：关闭后 tavily 不可调用
-2. 自动记忆开关：关闭后不再自动生成新记忆
-3. 目录白名单：配置 Agent 可访问的文件夹
-4. 单文件大小上限：默认 10MB
-5. 模型配置：base_url、api_key、model、temperature
-
----
-
-## 十四、分期开发计划（严格顺序，上阶段验收通过再进下一阶段）
+## 十二、分期开发计划
 ### 阶段0｜基座搭建
-后端 FastAPI+WebSocket、LangGraph ReAct 骨架、SQLite 建表、Vue 基础聊天页、read/write 文件工具（write 带确认）
-✅ 验收：文字对话、文件工具调用、流式返回、重启会话不丢
+FastAPI + WebSocket、LangGraph 基础 Graph、SQLite 建表、Tauri + Vue 基础界面、基础对话
+✅ 验收：前后端连通、流式对话、重启不丢
 
-### 阶段1｜MVP 文字完整版
-剪贴板/截图OCR/Tavily工具、SQLite持久化、记忆模块、统一工具钩子、上下文摘要、llm_adapter、WebSocket事件网关、主聊天窗口（含确认卡片）、设置面板、托盘
-✅ 验收：文字对话、读代码文档、截图分析、联网搜索、副作用工具弹确认、开关可控、长对话自动摘要
+### 阶段1｜核心权限 + 内置工具
+白名单机制、Middleware（Trace 埋点 + 白名单校验）、file_read/write/edit/open、删除确认（interrupt）、tavily、clipboard、shell_run、图片 OCR/VL 两链路 + 意图路由、后台任务 Runtime
+✅ 验收：除删除外工具全部自主执行；删除弹确认；轨迹记录；VL/OCR 自动路由
 
-### 阶段2｜悬浮宠物 + 全局快捷键
-悬浮窗口（透明/无边框/置顶/拖拽/Alpha穿透）、Alt+Space/Option+Space 唤起、宠物状态联动 Lottie
-✅ 验收：双平台常驻宠物、快捷键一键唤起
-
-### 阶段2.5｜语音秘书模块
-voice（faster-whisper+piper）、MCP Client、邮件日历工具、语音面板/波形/播报、语音确认（扩展）
-✅ 验收：语音提问查邮件日程+联网搜索，自动多工具调用，总结并语音播报
+### 阶段2｜MCP 商店 + 界面完善
+MCP 管理器 + 商店 UI、MCP 工具接入、三栏工作台、悬浮球、全局语音、轨迹面板、看板、资讯雷达
+✅ 验收：MCP 商店可装配置 MCP；Agent 调 MCP 工具；三栏 + 轨迹面板正常；语音
 
 ### 阶段3｜稳定性打磨
-双平台差异bug、权限、悬浮球拖拽偏移、置顶冲突、日志、优雅退出、开机自启、确认超时优化
+双平台差异、权限、超时、日志、优雅退出、任务并发控制、性能
 
-### 阶段4（可选）｜迁移 Tauri2
-保留 Vue 组件，Rust 重写外壳，Python 后端不动，打包 exe + dmg
+### 阶段4（V2）｜Multi-Agent + Agentic RAG 扩展
+Multi-Agent：规划师/文件操作员/调研员/审核员分工协作，架构预留接口
+Agentic RAG（可选）：文档切片入库 Milvus 向量库，新增 RAG 检索工具，Agent 自主检索知识库，详见第十五章
+> 两套扩展相互独立，可按需单独启用，互不依赖。
 
 ---
 
-## 十五、给 TRAE 的启动指令
+## 十五、Agentic RAG + Milvus（V2 可选扩展能力）
+> 状态：**MVP 不做，V2 阶段按需开发**。当前 MVP 方案：Agent 需要文档内容时直接调用 `file_read` 读取本机文件（架构简单、够用）。
+
+### 15.1 什么是 Agentic RAG
+普通 RAG：用户提问 → 检索向量库片段 → 交给 LLM 回答。
+Agentic RAG：把「检索」本身做成一个 Agent 可自主规划的工具。Agent 自己判断是否要检索、检索哪些文档、多次检索、调整关键词、对比多份资料，再综合回答。搭配 Milvus 向量数据库做持久向量存储。
+
+### 15.2 适合用 RAG 的场景
+- 大量私人文档/项目文档/技术笔记，希望 Agent 不用每次 `file_read`，直接在知识库检索
+- 历史对话、设计方案、需求文档入库，Agent 自主翻资料再干活
+- 上传一批参考资料，Agent 做方案时自主查阅参考库
+
+### 15.3 后端方案（V2 开发）
+1. 文档入库工具：扫描指定目录 → 切片 → Embedding 向量化 → 写入 Milvus
+2. Embedding 模型配置：独立配置（本地/云端 embedding）
+3. Milvus 向量库连接配置
+4. 新增 RAG 检索工具：作为普通工具加入工具池，**统一走现有 Middleware 中间件 + Trace 轨迹系统**
+5. Agent 系统提示词注入：允许 Agent 自主决定「直接 file_read 读原文件」还是「调 RAG 检索知识库」
+6. RAG 检索工具权限：✅自主执行（与现有工具一致）
+7. 新增依赖（V2 才加）：`pymilvus`、embedding 相关、`langchain`（如用其 text-splitter）
+
+### 15.4 前端改动清单（V2 开发 RAG 时）
+> 前端需要新增一个「知识库」能力入口，规划如下：
+
+1. **新增「知识库」导航 Tab**（顶部导航 或 左栏资讯雷达并列）
+   - 知识库列表：展示已建知识库（名称、文档数、向量数、更新时间）
+   - 知识库卡片操作：新建、删除（删除需走系统删除确认流程）、编辑
+2. **新建/配置知识库页**：
+   - 选择来源目录（目录选择器，路径校验）
+   - Embedding 模型配置选择
+   - 向量库连接状态展示（Milvus 是否连通）
+   - 入库触发按钮 + 入库进度条
+3. **文档入库状态页**：
+   - 待入库/已入库文档列表，切片进度、向量化进度
+   - 单个文档的入库状态、失败重试
+4. **检索测试面板**（可选）：
+   - 输入 query，实时展示 RAG 检索命中的文档片段与相关性分数
+   - 帮助验证知识库效果
+5. **对话中的 RAG 检索展示**：
+   - 当 Agent 调用 RAG 工具时，工具调用面板展示「检索了知识库X，命中N条」折叠信息
+   - 命中片段可展开查看来源
+6. **设置面板新增「知识库/RAG」配置区块**：
+   - Milvus 连接（host/port/collection）、Embedding 模型、默认来源目录
+   - RAG 开关（是否允许 Agent 使用 RAG 工具）
+
+### 15.5 前端改动原则
+- RAG 相关界面全部 V2 再加，MVP 不占界面
+- 新增 Tab/页面沿用三栏工作台 + 深色科技风设计语言
+- 前端只负责展示与配置，不直接连 Milvus/做 embedding，一切走后端 HTTP 接口
+- 工具调用轨迹面板自动覆盖 RAG 检索调用（无需额外开发）
+
+---
+
+## 十三、给 TRAE 的启动指令
 ```
-读取项目根目录 AGENTS.md 和 .trae/rules/ 下全部SKILL规则。
-项目名称NovaSecretary，Mac+Windows双桌面语音AI秘书，Electron+Vue + Python uv + FastAPI + LangGraph ReAct，手写interrupt做人工确认，支持LangChain联网工具、MCP邮件日历、本地语音ASR/TTS、悬浮宠物。
-我们从【阶段0：基座搭建】开始开发，先搭建后端FastAPI+websocket服务 + LangGraph基础ReAct Agent + SQLite存储基座 + Vue基础聊天页面，实现基础对话 + txt读写工具。
+读取项目根目录 AGENTS.md、FINAL_DEVELOPMENT_DOC.md 和 .trae/rules/ 下全部SKILL规则。
+项目名称NovaSecretary，跨平台桌面自主执行AI生产Agent。
+技术栈：Tauri(Vue3) + FastAPI + LangGraph + MCP SDK + SQLite。
+LangGraph：本项目MVP核心编排框架（Agent流程/循环/删除确认断点/后台长任务/状态保存全部基于它），已纳入开发范围。
+权限规则：除文件删除需人工确认外，文件读写/编辑/打开/截屏/执行命令/联网/调MCP全部自主执行；目录白名单兜底。
+后端四层架构：Runtime、Middleware、Core Agent(LangGraph)、MCP管理；Multi-Agent与Agentic RAG(Milvus)均为V2扩展，MVP不做。
+从【阶段0：基座搭建】开始，先搭建FastAPI+WebSocket、LangGraph基础Graph、SQLite、Tauri+Vue基础界面，实现基础对话。
 先输出阶段0任务清单、目录初始化命令、依赖清单，等待我确认，确认后再写代码。
 ```
 
 ---
 
-## 十六、RAG 与 MCP 扩展预留说明（为后续接入预留，MVP 不实现 RAG）
-> 目的：MVP 架构已为 RAG 和 MCP 预留清晰接入点，后续扩展不必重构。
-
-### 1. MCP（已预留，阶段2.5实现邮件/日历）
-- **预留位置**：`backend/mcp_client/`（MCP stdio 适配器目录，独立模块）
-- **当前状态**：阶段2.5 实现邮件、日历两个 MCP Server 连接
-- **后续扩展**：新增飞书、Notion、Google 日历等更多 MCP 服务
-- **接入方式**：在 `mcp_client/` 新增对应服务适配器 → 把新工具注册进 `agent_graph.py` 的 tools 列表 → 高危操作走统一人工确认钩子。无需改架构。
-- **约束**：MCP 使用 OAuth 授权，密钥不进 sqlite；敏感操作（发邮件/建日程）必须人工确认。
-
-### 2. RAG 本地知识库（已预留，MVP 不实现）
-- **预留位置**：扩展工具 `local_kb_search`（已列在扩展工具清单）；后端可新增 `backend/kb/` 模块放向量化与检索逻辑
-- **当前状态**：MVP 不做向量库/检索器，仅做本地单文件/会话文件问答
-- **后续扩展**：绑定指定文件夹，做本地知识库问答（RAG）
-- **接入方式**：新增向量库（如 Chroma / FAISS）→ 实现 `local_kb_search` 工具（从绑定目录检索片段返回）→ 注册进 Agent tools。检索结果同样走「仅本轮 state 使用 + 入库摘要」的 token 控制规范。
-- **约束**：检索范围限定用户显式绑定的文件夹，不自动全盘扫描；检索片段入库前摘要瘦身。
-
-### 扩展预留小结
-| 能力 | 预留位置 | MVP状态 | 扩展入口 |
-|---|---|---|---|
-| MCP 更多服务 | backend/mcp_client/ | 已实现邮件/日历 | 新增服务适配器 + 注册工具 |
-| RAG 本地知识库 | local_kb_search + backend/kb/ | 不实现 | 加向量库 + 实现检索工具 |
-
----
-
-## 十七、验收与交付规范
-- 每次交付完整可运行代码 + Windows PowerShell / Mac zsh 双套启动命令 + 依赖安装步骤
+## 十四、验收与交付规范
+- 完整可运行代码 + Windows PowerShell / Mac zsh 双套启动命令 + 依赖安装步骤
 - 密钥进 .env，禁止硬编码
-- 双平台差异在注释标明
-- 新增功能先方案评审，我确认后写代码
-- Bug 最小改动修复，不随意重构架构
-- 交付前自测，等待我验收
+- 双平台差异注释标明
+- 新增功能先方案评审
+- Bug 最小改动修复
+- 交付前自测，等待验收
+> 功能验证用 `ACCEPTANCE_TEST.md`，逐模块勾选。

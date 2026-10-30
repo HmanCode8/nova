@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,18 +36,33 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from backend.agent.agent_graph import build_agent, extract_interrupt, thread_config
-from backend.agent.llm_adapter import LLMConfigError, build_chat_model, has_api_key
+from backend.agent import model_profiles
+from backend.agent.llm_adapter import LLMConfigError, build_chat_model, has_api_key, local_http_client
 from backend.agent import memory_extractor
 from backend.agent import context_compress
 from backend.logging_setup import setup_logging
 from backend.mcp_client.client import close_client as close_mcp_client
-from backend.storage import file_extract, file_store, memory_store, project_store, session_store
+from backend.mcp_manager import catalog as mcp_catalog
+from backend.mcp_manager import get_manager as get_mcp_manager
+from backend.runtime import TaskRuntime
+from backend.runtime.task_runtime import set_runtime as _set_runtime
+from backend.storage import (
+    file_extract,
+    file_store,
+    memory_store,
+    project_store,
+    session_store,
+    task_store,
+    trace_store,
+)
 from backend.storage.config_store import get_config, save_config
 from backend.storage.db import APP_DATA_DIR, DB_PATH, db
-from backend.tools import get_all_tools
+from backend.tools import get_agent_tools
 from backend.tools.tool_hook import is_executable_path
 from backend.voice import asr as voice_asr
 from backend.voice import tts as voice_tts
@@ -69,10 +85,28 @@ async def lifespan(_: FastAPI):
         await file_store.cleanup_old_files(days=7)
     except Exception:
         pass  # 清理失败不影响启动
+    try:
+        # 上次进程遗留的 pending/running 任务标记为中断，避免状态永远卡住
+        stale = await task_store.mark_interrupted_tasks()
+        if stale:
+            logger.warning("启动清理：%d 个遗留后台任务已标记中断", stale)
+    except Exception:
+        pass
+    get_task_runtime()
+    # MCP 商店：后台激活已启用的服务（npx 首次拉包较慢，不阻塞启动）
+    asyncio.create_task(get_mcp_manager().activate_all())
     # 语音模型后台预热：不阻塞启动，失败只影响语音功能
     asyncio.create_task(asyncio.to_thread(voice_asr.warmup))
     asyncio.create_task(asyncio.to_thread(voice_tts.warmup))
     yield
+    try:
+        await get_task_runtime().shutdown()
+    except Exception:
+        pass
+    try:
+        await get_mcp_manager().close()
+    except Exception:
+        pass
     await close_mcp_client()
     await db.close()
 
@@ -101,7 +135,7 @@ async def get_agent_graph():
     async with _graph_lock:
         if _graph is None:
             model = await build_chat_model(streaming=True)
-            _graph = build_agent(model, tools=get_all_tools())
+            _graph = build_agent(model, tools=await get_agent_tools())
     return _graph
 
 
@@ -111,15 +145,41 @@ def reset_agent_graph() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 连接注册表 + 广播（后台任务日志需要推给所有打开的窗口）
+# ---------------------------------------------------------------------------
+
+_connections: "set[Any]" = set()
+_task_runtime: Optional[TaskRuntime] = None
+
+
+async def broadcast(payload: dict[str, Any]) -> None:
+    """把事件推给所有在线窗口（后台任务没有单一归属连接）。"""
+    for connection in list(_connections):
+        try:
+            await connection.send(payload)
+        except Exception:
+            _connections.discard(connection)
+
+
+def get_task_runtime() -> TaskRuntime:
+    global _task_runtime
+    if _task_runtime is None:
+        _task_runtime = TaskRuntime(get_agent_graph, broadcast)
+        _set_runtime(_task_runtime)  # 供 start_background_task 工具取用
+    return _task_runtime
+
+
+# ---------------------------------------------------------------------------
 # HTTP 接口
 # ---------------------------------------------------------------------------
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    profile = await model_profiles.get_active_profile()
     return {
         "status": "ok",
         "db_path": str(DB_PATH),
-        "model_configured": has_api_key(),
+        "model_configured": bool(profile and profile.get("has_key")) or has_api_key(),
         "vl_key_configured": bool((os.getenv("VL_API_KEY") or "").strip()),
     }
 
@@ -193,6 +253,221 @@ async def api_get_project(session_id: str) -> dict[str, Any]:
 @app.get("/api/config")
 async def api_get_config() -> dict[str, Any]:
     return await get_config()
+
+
+@app.get("/api/traces")
+async def api_list_traces(
+    session_id: str = "", task_id: str = "", search: str = "", limit: int = 200
+) -> dict[str, Any]:
+    """轨迹查询（FINAL_DEVELOPMENT_DOC 第三章）：按会话/任务/关键词过滤。"""
+    items = await trace_store.query(
+        session_id=session_id, task_id=task_id, search=search, limit=limit
+    )
+    return {"traces": items}
+
+
+@app.delete("/api/traces")
+async def api_clear_traces(session_id: str = "") -> dict[str, Any]:
+    await trace_store.clear(session_id)
+    return {"ok": True}
+
+
+@app.get("/api/tasks")
+async def api_list_tasks(session_id: str = "", limit: int = 50) -> dict[str, Any]:
+    """后台任务列表（FINAL_DEVELOPMENT_DOC 第四章 Runtime 接口）。"""
+    return {"tasks": await task_store.list_tasks(session_id=session_id, limit=limit)}
+
+
+@app.post("/api/tasks")
+async def api_create_task(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    session_id = str(payload.get("session_id") or "")
+    prompt = str(payload.get("prompt") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    if await session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    try:
+        task = await get_task_runtime().submit(session_id, prompt, title)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"task": task}
+
+
+@app.post("/api/tasks/{task_id}/stop")
+async def api_stop_task(task_id: str) -> dict[str, Any]:
+    if not await get_task_runtime().stop(task_id):
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    return {"ok": True}
+
+
+@app.get("/api/mcp/catalog")
+async def api_mcp_catalog() -> dict[str, Any]:
+    """MCP 商店目录（卡片画廊 / 分类 / 搜索的静态数据源）。"""
+    return mcp_catalog.list_catalog()
+
+
+@app.get("/api/mcp/servers")
+async def api_mcp_servers() -> dict[str, Any]:
+    return {"servers": await get_mcp_manager().list_servers()}
+
+
+@app.post("/api/mcp/servers")
+async def api_mcp_install(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """安装 / 更新 MCP 服务并立即激活（工具随即注册进 Agent）。"""
+    try:
+        normalized = mcp_catalog.resolve_install(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    record = await get_mcp_manager().install(normalized)
+    reset_agent_graph()  # 工具集变化，重建图
+    servers = await get_mcp_manager().list_servers()
+    current = next((item for item in servers if item["id"] == record["id"]), record)
+    return {"server": current}
+
+
+@app.post("/api/mcp/servers/{server_id}/toggle")
+async def api_mcp_toggle(server_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    enabled = bool(payload.get("enabled", True))
+    if not await get_mcp_manager().set_enabled(server_id, enabled):
+        raise HTTPException(status_code=404, detail="MCP 服务不存在")
+    reset_agent_graph()
+    servers = await get_mcp_manager().list_servers()
+    return {"servers": servers}
+
+
+@app.delete("/api/mcp/servers/{server_id}")
+async def api_mcp_uninstall(server_id: str) -> dict[str, Any]:
+    if not await get_mcp_manager().uninstall(server_id):
+        raise HTTPException(status_code=404, detail="MCP 服务不存在")
+    reset_agent_graph()
+    return {"servers": await get_mcp_manager().list_servers()}
+
+
+@app.post("/api/mcp/import")
+async def api_mcp_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """粘贴配置导入：兼容 mcpServers 写法，自动识别 stdio / streamable-http。"""
+    from backend.mcp_manager import importer
+
+    try:
+        items = importer.parse(str(payload.get("json") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    imported: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    for item in items:
+        try:
+            normalized = mcp_catalog.resolve_install(item)
+            record = await get_mcp_manager().install(normalized)
+            imported.append(
+                {"id": record.get("id"), "name": record.get("name"), "transport": record.get("transport")}
+            )
+        except Exception as exc:  # 单条失败不影响其它条目
+            failed.append({"name": str(item.get("name") or ""), "error": str(exc)[:200]})
+
+    if imported:
+        reset_agent_graph()
+    servers = await get_mcp_manager().list_servers()
+    return {"imported": imported, "failed": failed, "servers": servers}
+
+
+@app.post("/api/mcp/servers/{server_id}/test")
+async def api_mcp_test(server_id: str) -> dict[str, Any]:
+    """测试连接并返回工具清单。"""
+    try:
+        return await get_mcp_manager().discover(server_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+RADAR_KEYWORDS = ("email_list", "rss", "news", "feed", "list_today", "article")
+RADAR_LIST_KEYS = ("emails", "items", "articles", "entries", "data", "list", "results")
+
+
+def _radar_items(raw: str, source: str, limit: int) -> list[dict[str, str]]:
+    """把 MCP 返回的原始数据归一化成资讯条目（只做字段映射，不做任何解析加工）。"""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        text = (raw or "").strip()
+        return (
+            [{"title": text[:80], "summary": text[:240], "source": source, "time": ""}]
+            if text
+            else []
+        )
+    if isinstance(payload, dict):
+        entries: Any = []
+        for key in RADAR_LIST_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                entries = value
+                break
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        entries = []
+
+    items: list[dict[str, str]] = []
+    for entry in entries[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        title = str(
+            entry.get("title") or entry.get("subject") or entry.get("name") or entry.get("id") or ""
+        ).strip()
+        if not title:
+            continue
+        summary = str(
+            entry.get("summary") or entry.get("snippet") or entry.get("content") or entry.get("description") or ""
+        ).strip()
+        when = str(entry.get("time") or entry.get("date") or entry.get("published") or "")
+        items.append(
+            {
+                "title": title[:120],
+                "summary": summary[:240],
+                "source": source,
+                "time": when[:32],
+            }
+        )
+    return items
+
+
+@app.get("/api/radar")
+async def api_radar(limit: int = 12) -> dict[str, Any]:
+    """资讯雷达数据源：调用已安装 MCP 里的资讯类工具，原样取回条目。
+
+    FINAL_DEVELOPMENT_DOC 第三章：左栏数据源来自 MCP；这里只做字段归一化，
+    不做解析加工（附件解析仍交给内置工具）。
+    """
+    manager = get_mcp_manager()
+    tools = await manager.build_tools()
+    sources: list[dict[str, Any]] = []
+    items: list[dict[str, str]] = []
+
+    for tool in tools:
+        name = getattr(tool, "name", "") or ""
+        if not any(key in name.lower() for key in RADAR_KEYWORDS):
+            continue
+        entry = {"name": name, "ok": False, "message": "", "count": 0}
+        try:
+            raw = await tool.ainvoke({})
+            parsed = _radar_items(str(raw), name, max(1, min(limit, 30)))
+            items.extend(parsed)
+            entry.update(ok=True, count=len(parsed), message=f"{len(parsed)} 条")
+        except Exception as exc:  # 需要参数 / 未连接：如实标记，不影响其它源
+            entry["message"] = str(exc)[:160]
+        sources.append(entry)
+
+    if not sources:
+        servers = await manager.list_servers()
+        for server in servers:
+            sources.append(
+                {
+                    "name": server.get("name") or server.get("id"),
+                    "ok": False,
+                    "message": "该服务未提供资讯类工具",
+                    "count": 0,
+                }
+            )
+    return {"items": items[: max(1, min(limit, 60))], "sources": sources}
 
 
 @app.post("/upload")
@@ -323,9 +598,10 @@ def _normalize_config_patch(payload: dict[str, Any]) -> dict[str, Any]:
             model["top_p"] = top_p
         if "reasoning_effort" in model:
             effort = str(model["reasoning_effort"] or "").strip().lower()
-            if effort not in ("", "low", "medium", "high"):
+            if effort not in ("", "minimal", "low", "medium", "high", "max"):
                 raise HTTPException(
-                    status_code=400, detail="reasoning_effort 只能是 low / medium / high 或留空"
+                    status_code=400,
+                    detail="reasoning_effort 只能是 minimal / low / medium / high / max 或留空",
                 )
             model["reasoning_effort"] = effort
         if "thinking_enabled" in model:
@@ -437,6 +713,8 @@ def _normalize_config_patch(payload: dict[str, Any]) -> dict[str, Any]:
         cleaned["allowed_dirs"] = normalized
 
     for key in (
+        "autonomy_mode",
+        "shell_enabled",
         "web_search_enabled",
         "auto_memory_enabled",
         "tts_enabled",
@@ -455,6 +733,124 @@ async def api_save_config(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
     merged = await save_config(_normalize_config_patch(payload))
     reset_agent_graph()  # 模型参数可能变化，下一轮重建
     return merged
+
+
+# ---------------------------------------------------------------------------
+# 模型档案：多套模型一键切换（密钥只写 .env，前端拿不到明文）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/models")
+async def api_list_models() -> dict[str, Any]:
+    return await model_profiles.list_profiles()
+
+
+@app.post("/api/models")
+async def api_upsert_model(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        result = await model_profiles.upsert_profile(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reset_agent_graph()
+    return result
+
+
+@app.post("/api/models/{profile_id}/activate")
+async def api_activate_model(profile_id: str) -> dict[str, Any]:
+    try:
+        result = await model_profiles.activate_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    reset_agent_graph()
+    return result
+
+
+@app.put("/api/models/{profile_id}/key")
+async def api_set_model_key(
+    profile_id: str, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    try:
+        result = await model_profiles.set_profile_key(profile_id, str(payload.get("api_key") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reset_agent_graph()
+    return result
+
+
+@app.delete("/api/models/{profile_id}")
+async def api_delete_model(profile_id: str) -> dict[str, Any]:
+    try:
+        result = await model_profiles.delete_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reset_agent_graph()
+    return result
+
+
+@app.post("/api/models/test")
+async def api_test_model(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """连通性测试：发一句最短请求，返回耗时；不在响应里泄露密钥。
+
+    同时回报该档案声明的能力是否配置完整（不触发真实生图，避免产生费用）。
+    """
+    profile_id = str(payload.get("id") or "").strip()
+    data = await model_profiles.list_profiles()
+    target = next(
+        (p for p in data["profiles"] if p["id"] == (profile_id or data["active_id"])), None
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="模型档案不存在")
+
+    image_info = _image_capability_info(target)
+    if not target.get("has_key"):
+        return {"ok": False, "message": f"未配置密钥（{target['api_key_env']}）", "image": image_info}
+    if not target.get("base_url") or not target.get("model_name"):
+        return {"ok": False, "message": "Base URL 或模型名称未填写", "image": image_info}
+
+    started = time.monotonic()
+    base_url = target["base_url"]
+    http_client = local_http_client(base_url)
+    try:
+        model = ChatOpenAI(
+            model=target["model_name"],
+            base_url=base_url,
+            api_key=os.getenv(target["api_key_env"]) or os.getenv("LLM_API_KEY") or "ollama",
+            temperature=0,
+            max_retries=0,
+            timeout=20,
+            streaming=False,
+            **({"http_async_client": http_client} if http_client else {}),
+        )
+        await asyncio.wait_for(model.ainvoke("只回复 ok"), timeout=25)
+    except Exception as exc:  # 网络 / 鉴权 / 模型不存在都统一回报
+        return {"ok": False, "message": f"连接失败：{exc}", "image": image_info}
+    return {
+        "ok": True,
+        "message": "连接正常",
+        "latency_ms": int((time.monotonic() - started) * 1000),
+        "image": image_info,
+    }
+
+
+def _image_capability_info(profile: dict[str, Any]) -> dict[str, Any]:
+    """生图能力的本地校验结果（不发起真实请求）。"""
+    capabilities = profile.get("capabilities") or []
+    if "image" not in capabilities:
+        return {"enabled": False, "ready": False, "message": "未声明可生成图片"}
+    image = profile.get("image") or {}
+    provider = "百炼原生" if image.get("provider") == "dashscope" else "OpenAI 兼容"
+    model = image.get("model") or profile.get("model_name") or ""
+    base_url = image.get("base_url") or profile.get("base_url") or ""
+    if not model or not base_url:
+        return {"enabled": True, "ready": False, "message": "生图模型或服务地址未填写", "provider": provider}
+    if not profile.get("has_key"):
+        return {"enabled": True, "ready": False, "message": "缺少密钥", "provider": provider, "model": model}
+    return {
+        "enabled": True,
+        "ready": True,
+        "provider": provider,
+        "model": model,
+        "message": f"生图已就绪（{provider} / {model}）",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +1004,7 @@ CARD_TOOL_KINDS: dict[str, str] = {
     "plan_project": "project_plan",
     "update_project_step": "project_plan",
     "generate_image": "image_result",
+    "show_image": "image_result",
 }
 
 
@@ -666,6 +1063,8 @@ class ChatConnection:
             await self._on_confirm_result(message)
         elif msg_type == "control":
             await self._on_control(message)
+        elif msg_type == "task_create":
+            await self._on_task_create(message)
         elif msg_type == "voice":
             await self._on_voice(message)
         else:
@@ -698,6 +1097,9 @@ class ChatConnection:
         confirm_id = str(message.get("confirm_id") or "")
         accepted = bool(message.get("accepted"))
         if not self._pending or self._pending["confirm_id"] != confirm_id:
+            # 不属于当前连接的交互式对话，尝试路由到后台任务
+            if await get_task_runtime().resolve_confirm(confirm_id, accepted):
+                return
             await self.send({"type": "error", "message": "确认已失效或不存在"})
             return
         if self._task and not self._task.done():
@@ -709,7 +1111,20 @@ class ChatConnection:
 
     async def _on_control(self, message: dict[str, Any]) -> None:
         action = message.get("action")
-        if action in ("stop", "cancel"):
+        task_id = str(message.get("task_id") or "")
+        # 带 task_id 的控制指令作用于后台任务（FINAL_DEVELOPMENT_DOC 第十一章）
+        if task_id and action in ("stop", "cancel", "stop_task"):
+            stopped = await get_task_runtime().stop(task_id)
+            await self.send(
+                {
+                    "type": "task_status",
+                    "task_id": task_id,
+                    "status": "cancelled" if stopped else "unknown",
+                }
+            )
+            return
+        # stop_task 是 FINAL_DEVELOPMENT_DOC 第十一章的协议名，stop/cancel 为历史别名
+        if action in ("stop", "cancel", "stop_task"):
             if self._task and not self._task.done():
                 self._task.cancel()
             self._speak_next = False
@@ -723,6 +1138,28 @@ class ChatConnection:
             await self.send({"type": "error", "message": "已停止当前生成"})
 
     # -- 语音链路（按住说话 → ASR；回复完成 → TTS） -------------------------
+
+    async def _on_task_create(self, message: dict[str, Any]) -> None:
+        """新建后台长任务：立即返回 task_id，执行过程通过广播推送 task_log。"""
+        session_id = str(message.get("session_id") or "")
+        prompt = str(message.get("prompt") or "").strip()
+        title = str(message.get("title") or "").strip()
+        if await session_store.get_session(session_id) is None:
+            await self.send({"type": "error", "message": "会话不存在，请先新建会话"})
+            return
+        try:
+            task = await get_task_runtime().submit(session_id, prompt, title)
+        except ValueError as exc:
+            await self.send({"type": "error", "message": str(exc)})
+            return
+        await self.send(
+            {
+                "type": "task_created",
+                "task_id": task["id"],
+                "session_id": session_id,
+                "title": task.get("title", ""),
+            }
+        )
 
     async def _on_voice(self, message: dict[str, Any]) -> None:
         action = str(message.get("action") or "")
@@ -939,6 +1376,7 @@ class ChatConnection:
 
         config = thread_config(thread_id)
         text_parts: list[str] = []
+        reason_parts: list[str] = []
         interrupt_payload: Optional[dict[str, Any]] = None
 
         try:
@@ -947,9 +1385,11 @@ class ChatConnection:
             ):
                 if mode == "messages":
                     chunk, metadata = data
-                    if metadata.get("langgraph_node") == "agent":
+                    # finalize 是循环熔断后的收尾节点，它的输出同样要流式推给前端
+                    if metadata.get("langgraph_node") in ("agent", "finalize"):
                         reasoning = _chunk_reasoning(chunk)
                         if reasoning:
+                            reason_parts.append(reasoning)
                             await self.send({"type": "reasoning", "delta": reasoning})
                         delta = _chunk_text(chunk)
                         if delta:
@@ -982,7 +1422,7 @@ class ChatConnection:
                                 "status": "done",
                             }
                         )
-                        if tool_name == "tavily_web_search":
+                        if tool_name in ("tavily_web_search", "tavily_search"):
                             query, items = _extract_search_items(str(getattr(msg, "content", "")))
                             if items:
                                 await self.send(
@@ -1003,6 +1443,22 @@ class ChatConnection:
                         )
         except asyncio.CancelledError:
             raise
+        except GraphRecursionError:
+            # 兜底：熔断没拦住时也不要把原始异常甩给用户，带上已产出的内容优雅收尾
+            self._speak_next = False
+            logger.warning("Agent 触发递归上限：session=%s", session_id)
+            notice = (
+                "本轮工具调用次数过多，已自动停止以免陷入死循环。"
+                "如果任务还没做完，请把需求拆小一点（例如先只做第一项）再试。"
+            )
+            partial = "".join(text_parts).strip()
+            content = f"{partial}\n\n{notice}" if partial else notice
+            await session_store.add_message(session_id, "assistant", content)
+            await session_store.touch_session(session_id)
+            await self.send(
+                {"type": "message", "role": "assistant", "content": content, "session_id": session_id}
+            )
+            return
         except Exception as exc:  # 兜底：任何异常都要回前端，避免前端无限转圈
             self._speak_next = False
             logger.exception("Agent 执行失败：session=%s", session_id)
@@ -1016,22 +1472,32 @@ class ChatConnection:
                 "thread_id": thread_id,
                 "session_id": session_id,
             }
+            action = str(interrupt_payload.get("action") or interrupt_payload.get("tool_name") or "")
+            # 协议对齐（FINAL_DEVELOPMENT_DOC 第十一章）：删除用 delete_confirm 事件，
+            # 其它副作用工具沿用 human_confirm；两者字段一致，前端同一套弹窗处理。
+            event_type = (
+                "delete_confirm" if action in ("file_delete", "delete_file") else "human_confirm"
+            )
             await self.send(
                 {
-                    "type": "human_confirm",
+                    "type": event_type,
                     "confirm_id": confirm_id,
-                    "action": interrupt_payload.get("action", ""),
+                    "action": action,
                     "tool_name": interrupt_payload.get("tool_name", ""),
                     "preview_text": interrupt_payload.get("preview_text", ""),
                     "params": interrupt_payload.get("params", {}),
+                    "path": (interrupt_payload.get("params") or {}).get("path", ""),
                 }
             )
             self._start_timeout(confirm_id)
             return
 
         final_text = "".join(text_parts).strip()
+        final_reasoning = "".join(reason_parts).strip()
         if final_text:
-            await session_store.add_message(session_id, "assistant", final_text)
+            await session_store.add_message(
+                session_id, "assistant", final_text, reasoning=final_reasoning or None
+            )
             await session_store.touch_session(session_id)
             await self.send(
                 {"type": "message", "role": "assistant", "content": final_text, "session_id": session_id}
@@ -1085,6 +1551,7 @@ class ChatConnection:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     connection = ChatConnection(websocket)
+    _connections.add(connection)  # 后台任务日志需要广播到所有窗口
     try:
         while True:
             message = await websocket.receive_json()
@@ -1095,6 +1562,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception:
         pass
     finally:
+        _connections.discard(connection)
         await connection.close()
 
 

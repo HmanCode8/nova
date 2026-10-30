@@ -2,10 +2,16 @@
 技能描述：所有带副作用的工具，执行前暂停Agent，推送待确认事件到前端，用户手动确认后才执行
 
 ## 适用工具范围
-- write_file：写入/覆盖本地文件
+默认（自主模式 autonomy_mode = true，默认值）：
+- delete_file：删除文件/目录（唯一强制确认项，任何模式都不放行）
+- run_shell：命令命中破坏性黑名单时降级为确认
+
+自主模式关闭后，以下工具恢复逐一确认：
+- write_file / write_project_files：写入/覆盖本地文件
 - open_local_file：调用系统软件打开文档
 - email_send：发送邮件
 - calendar_create：新建日历事件
+- run_shell：全部命令
 
 ## 交互流程
 1. Agent调用带确认标记的工具
@@ -36,10 +42,11 @@
 8. 超时规则：3分钟内未收到用户响应，自动判定为取消，释放Agent状态，避免卡死
 
 ## 硬校验前置（必须无条件执行）
-1. open_local_file / write_file：路径必须在系统配置的目录白名单内
-2. open_local_file：禁止打开exe/bat/cmd/ps1/com等可执行后缀
-3. email_send：必须校验收件人、正文非空
-4. calendar_create：必须校验标题、时间字段合法
+1. delete_file：禁止删除盘符根目录、系统目录、应用数据目录；目录必须显式 recursive
+2. open_local_file / write_file：自主模式关闭时路径必须在目录白名单内；自主模式下忽略白名单
+3. open_local_file：禁止打开exe/bat/cmd/ps1/com等可执行后缀
+4. email_send：必须校验收件人、正文非空
+5. calendar_create：必须校验标题、时间字段合法
 
 ## MVP边界
 - MVP阶段仅支持鼠标点击按钮确认

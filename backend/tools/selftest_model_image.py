@@ -35,24 +35,66 @@ PNG_BYTES = base64.b64decode(
 
 class _StubImageHandler(BaseHTTPRequestHandler):
     paths: list[str] = []
+    polls: int = 0
 
-    def do_POST(self) -> None:  # noqa: N802
-        type(self).paths.append(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(length) or b"{}")
-        if not body.get("prompt"):
-            self.send_error(400, "missing prompt")
-            return
-        payload = {
-            "created": 0,
-            "data": [{"b64_json": base64.b64encode(PNG_BYTES).decode("ascii")}],
-        }
+    def _json(self, payload: dict) -> None:
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _bytes(self, raw: bytes, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self) -> None:  # noqa: N802
+        type(self).paths.append(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+
+        # 百炼原生：提交异步任务
+        if self.path.endswith("/image-synthesis"):
+            if not (body.get("input") or {}).get("prompt"):
+                self.send_error(400, "missing prompt")
+                return
+            self._json({"output": {"task_id": "task-1", "task_status": "PENDING"}})
+            return
+
+        if not body.get("prompt"):
+            self.send_error(400, "missing prompt")
+            return
+        self._json(
+            {"created": 0, "data": [{"b64_json": base64.b64encode(PNG_BYTES).decode("ascii")}]}
+        )
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).paths.append(self.path)
+        host = f"http://127.0.0.1:{self.server.server_address[1]}"
+        # 百炼任务查询：第一次 PENDING，第二次 SUCCEEDED
+        if self.path.startswith("/api/v1/tasks/"):
+            type(self).polls += 1
+            if type(self).polls == 1:
+                self._json({"output": {"task_id": "task-1", "task_status": "RUNNING"}})
+            else:
+                self._json(
+                    {
+                        "output": {
+                            "task_id": "task-1",
+                            "task_status": "SUCCEEDED",
+                            "results": [{"url": f"{host}/generated.png"}],
+                        }
+                    }
+                )
+            return
+        if self.path == "/generated.png":
+            self._bytes(PNG_BYTES, "image/png")
+            return
+        self.send_error(404, "not found")
 
     def log_message(self, *args) -> None:  # noqa: ANN002
         return
@@ -104,7 +146,7 @@ async def main() -> int:
         await save_config({"image_gen_enabled": False})
         disabled = await generate_image.ainvoke({"prompt": "一只猫"})
         print("4) 未启用：", disabled)
-        if "未启用" not in disabled:
+        if "没有可用的生图模型" not in disabled:
             errors.append("未启用时没有返回友好提示")
 
         # 5. 启用但缺模型名
@@ -150,6 +192,75 @@ async def main() -> int:
                 errors.append("返回的展示地址格式不正确")
         if not _StubImageHandler.paths or "/v1/images/generations" not in _StubImageHandler.paths[0]:
             errors.append("请求路径不是 /v1/images/generations")
+
+        # 7. 能力路由：档案勾选「可生成图片」后优先于全局配置
+        _StubImageHandler.paths.clear()
+        await save_config(
+            {
+                "image_gen_enabled": True,
+                "image_gen_base_url": f"http://127.0.0.1:{port}/v1",
+                "image_gen_model": "stub-image",
+                "image_gen_size": "512x512",
+                "model_profiles": [
+                    {
+                        "id": "chat-only",
+                        "name": "纯对话",
+                        "base_url": f"http://127.0.0.1:{port}/v1",
+                        "model_name": "chat-model",
+                        "api_key_env": "IMAGE_API_KEY",
+                        "capabilities": ["chat"],
+                    },
+                    {
+                        "id": "img-openai",
+                        "name": "带出图能力",
+                        "base_url": f"http://127.0.0.1:{port}/v1",
+                        "model_name": "chat-model",
+                        "api_key_env": "IMAGE_API_KEY",
+                        "capabilities": ["chat", "image"],
+                        "image": {"provider": "openai", "model": "profile-image", "size": "768x768"},
+                    },
+                ],
+                "active_model_id": "chat-only",
+            }
+        )
+        routed = json.loads(await generate_image.ainvoke({"prompt": "一只猫"}))
+        print("7) 能力路由：", {k: routed.get(k) for k in ("source", "model", "provider", "size")})
+        if routed.get("source") != "带出图能力" or routed.get("model") != "profile-image":
+            errors.append("没有按能力路由到声明了 image 的档案")
+        if routed.get("size") != "768x768":
+            errors.append("没有使用档案里的出图尺寸")
+
+        # 8. 百炼原生异步链路：提交任务 → 轮询 → 下载落盘
+        _StubImageHandler.paths.clear()
+        _StubImageHandler.polls = 0
+        await save_config(
+            {
+                "model_profiles": [
+                    {
+                        "id": "img-dashscope",
+                        "name": "百炼出图",
+                        "base_url": f"http://127.0.0.1:{port}/compatible-mode/v1",
+                        "model_name": "qwen-plus",
+                        "api_key_env": "IMAGE_API_KEY",
+                        "capabilities": ["chat", "image"],
+                        "image": {"provider": "dashscope", "model": "wanx2.1-t2i-turbo"},
+                    }
+                ],
+                "active_model_id": "img-dashscope",
+            }
+        )
+        dashscope = json.loads(await generate_image.ainvoke({"prompt": "一只猫"}))
+        print("8) 百炼出图：", {k: dashscope.get(k) for k in ("source", "model", "provider")})
+        if dashscope.get("provider") != "dashscope":
+            errors.append("没有走百炼原生分支")
+        if not any(path.endswith("/image-synthesis") for path in _StubImageHandler.paths):
+            errors.append("没有调用百炼任务提交接口")
+        if not any(path.startswith("/api/v1/tasks/") for path in _StubImageHandler.paths):
+            errors.append("没有轮询百炼任务状态")
+        if not dashscope.get("images"):
+            errors.append("百炼出图没有落盘")
+        else:
+            created.append(Path(dashscope["images"][0]["path"]))
     finally:
         server.shutdown()
         for path in created:

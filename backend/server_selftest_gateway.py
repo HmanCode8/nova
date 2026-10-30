@@ -79,7 +79,11 @@ def main() -> None:
 
         cfg = client.put(
             "/api/config",
-            json={"allowed_dirs": [str(workdir)], "confirm_timeout_seconds": 5},
+            json={
+                "allowed_dirs": [str(workdir)],
+                "confirm_timeout_seconds": 5,
+                "autonomy_mode": False,  # 本测试验证“逐步确认”链路
+            },
         )
         assert cfg.status_code == 200 and cfg.json()["confirm_timeout_seconds"] == 5
 

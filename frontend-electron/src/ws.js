@@ -31,6 +31,47 @@ export const api = {
     (await request(`/api/sessions/${encodeURIComponent(id)}/project`)).project,
   getConfig: () => request('/api/config'),
   saveConfig: (patch) => request('/api/config', { method: 'PUT', body: patch }),
+  listTraces: (params = {}) => {
+    const query = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.set(key, value)
+    })
+    const suffix = query.toString()
+    return request(`/api/traces${suffix ? `?${suffix}` : ''}`)
+  },
+  clearTraces: (sessionId) =>
+    request(`/api/traces?session_id=${encodeURIComponent(sessionId || '')}`, {
+      method: 'DELETE'
+    }),
+  listTasks: async (sessionId) =>
+    (await request(`/api/tasks?session_id=${encodeURIComponent(sessionId || '')}`)).tasks,
+  createTask: (sessionId, prompt, title) =>
+    request('/api/tasks', {
+      method: 'POST',
+      body: { session_id: sessionId, prompt, title }
+    }),
+  stopTask: (taskId) => request(`/api/tasks/${taskId}/stop`, { method: 'POST' }),
+  getMcpCatalog: () => request('/api/mcp/catalog'),
+  getRadar: (limit = 12) => request(`/api/radar?limit=${limit}`),
+  listMcpServers: async () => (await request('/api/mcp/servers')).servers,
+  installMcp: (payload) => request('/api/mcp/servers', { method: 'POST', body: payload }),
+  importMcp: (text) => request('/api/mcp/import', { method: 'POST', body: { json: text } }),
+  toggleMcp: (id, enabled) =>
+    request(`/api/mcp/servers/${encodeURIComponent(id)}/toggle`, {
+      method: 'POST',
+      body: { enabled }
+    }),
+  deleteMcp: async (id) =>
+    (await request(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: 'DELETE' })).servers,
+  testMcp: (id) =>
+    request(`/api/mcp/servers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  listModels: () => request('/api/models'),
+  saveModel: (profile) => request('/api/models', { method: 'POST', body: profile }),
+  activateModel: (id) => request(`/api/models/${id}/activate`, { method: 'POST' }),
+  setModelKey: (id, apiKey) =>
+    request(`/api/models/${id}/key`, { method: 'PUT', body: { api_key: apiKey } }),
+  deleteModel: (id) => request(`/api/models/${id}`, { method: 'DELETE' }),
+  testModel: (id) => request('/api/models/test', { method: 'POST', body: { id } }),
   listMemory: (sessionId) =>
     request(`/api/memory?session_id=${encodeURIComponent(sessionId || '')}`),
   addMemory: (scope, text, sessionId) =>

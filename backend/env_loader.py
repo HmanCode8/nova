@@ -41,3 +41,26 @@ def load_env() -> Path | None:
 def env_file_path() -> Path:
     """当前使用的 .env 路径（不存在时返回首选路径，供提示/创建用）。"""
     return _loaded or env_candidates()[0]
+
+
+def set_env_value(name: str, value: str) -> Path:
+    """把 KEY=VALUE 写入 .env（存在则替换该行，不存在则追加），并同步到当前进程。
+
+    密钥只落 .env，绝不进 SQLite（05-storage-spec / J1）。
+    """
+    path = env_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith(f"{name}="):
+            lines[index] = f"{name}={value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{name}={value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.environ[name] = value
+    return path

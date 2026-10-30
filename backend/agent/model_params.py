@@ -16,7 +16,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
-REASONING_EFFORTS: tuple[str, ...] = ("", "low", "medium", "high")
+REASONING_EFFORTS: tuple[str, ...] = ("", "minimal", "low", "medium", "high", "max")
+
+
+def thinking_provider(base_url: str) -> str:
+    """按服务地址判断思考开关的字段风格。
+
+    - DeepSeek（V4：deepseek-flash / deepseek-v4-pro）：{"thinking": {"type": "enabled|disabled"}}
+      且官方默认开启，不传就是开
+    - 阿里百炼 / 硅基流动 / vLLM：enable_thinking（默认关闭）
+    """
+    text = (base_url or "").lower()
+    if "deepseek" in text:
+        return "deepseek"
+    return "qwen"
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -46,8 +59,11 @@ def normalize_extra_body(value: Any) -> dict[str, Any]:
     return {}
 
 
-def build_model_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
-    """根据 model 配置生成 ChatOpenAI 可选参数（不含 model/base_url/api_key/temperature）。"""
+def build_model_kwargs(model_cfg: dict[str, Any], base_url: str = "") -> dict[str, Any]:
+    """根据 model 配置生成 ChatOpenAI 可选参数（不含 model/base_url/api_key/temperature）。
+
+    base_url 用于判断思考开关的字段风格：DeepSeek 用 thinking.type，其余用 enable_thinking。
+    """
     cfg = model_cfg if isinstance(model_cfg, dict) else {}
     kwargs: dict[str, Any] = {}
 
@@ -64,9 +80,16 @@ def build_model_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
         kwargs["reasoning_effort"] = effort
 
     extra_body = normalize_extra_body(cfg.get("extra_body"))
+    provider = thinking_provider(base_url)
     if cfg.get("thinking_enabled"):
         # setdefault：用户显式写在 extra_body 里的值优先
-        extra_body.setdefault("enable_thinking", True)
+        if provider == "deepseek":
+            extra_body.setdefault("thinking", {"type": "enabled"})
+        else:
+            extra_body.setdefault("enable_thinking", True)
+    elif provider == "deepseek":
+        # DeepSeek 默认开启思考，必须显式关闭才真的不思考
+        extra_body.setdefault("thinking", {"type": "disabled"})
     thinking_budget = _as_int(cfg.get("thinking_budget"))
     if thinking_budget > 0:
         extra_body.setdefault("thinking_budget", thinking_budget)
